@@ -17,6 +17,7 @@ import path from "path";
 import { readFileSync, existsSync } from "fs";
 import { resolve } from "path";
 import { gateDataPlugin } from "../plugins/gated-storage-plugin/index.js";
+import { recallStoragePlugin } from "../plugins/plugin-recall-storage/index.js";
 
 const __dirname = path.dirname(new URL(import.meta.url).pathname);
 
@@ -43,6 +44,7 @@ import { Bot, Context } from "grammy";
 import { bootstrapPlugin } from "@ai16z/plugin-bootstrap";
 import { collablandPlugin } from "../plugins/collabland.plugin.js";
 import { StorageService } from "../plugins/gated-storage-plugin/services/storage.service.js";
+import { RecallService } from "../plugins/plugin-recall-storage/services/recall.service.js";
 
 const MAX_MESSAGE_LENGTH = 4096; // Telegram's max message length
 
@@ -593,7 +595,12 @@ export class ElizaService extends BaseService {
         modelProvider: character.modelProvider || ModelProviderName.OPENAI,
         character,
         conversationLength: 4096,
-        plugins: [bootstrapPlugin, collablandPlugin, gateDataPlugin],
+        plugins: [
+          bootstrapPlugin,
+          collablandPlugin,
+          gateDataPlugin,
+          recallStoragePlugin,
+        ],
         cacheManager: new CacheManager(new MemoryCacheAdapter()),
         logging: true,
       });
@@ -602,6 +609,7 @@ export class ElizaService extends BaseService {
         tableName: "onchain",
         runtime: this.runtime,
       });
+
       this.runtime.registerMemoryManager(onChainMemory);
       this.messageManager = new MessageManager(bot, this.runtime);
       this.bot = bot;
@@ -623,6 +631,10 @@ export class ElizaService extends BaseService {
       // make sure this gets initialized before anything tries to use it in the plugin.
       // not sure where this should actually be hooked up
       await StorageService.getInstance().start();
+
+      const service = new RecallService(this.runtime);
+      await service.initialize(this.runtime);
+      elizaLogger.info("Recall service started successfully", service);
     } catch (err) {
       elizaLogger.warn("[eliza] gated storage service is unavailable");
     }

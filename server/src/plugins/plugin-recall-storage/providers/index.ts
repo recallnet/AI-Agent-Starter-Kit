@@ -1,0 +1,32 @@
+import {
+  IAgentRuntime,
+  Memory,
+  Provider,
+  State,
+  ServiceType,
+  elizaLogger,
+} from "@ai16z/eliza";
+import { RecallService } from "../services/recall.service.js";
+
+export const recallCotProvider: Provider = {
+  get: async (
+    runtime: IAgentRuntime,
+    message: Memory,
+    _state?: State
+  ): Promise<Error | string> => {
+    if (!process.env.RECALL_BUCKET_ALIAS) {
+      elizaLogger.error("RECALL_BUCKET_ALIAS is not set");
+    }
+    try {
+      const recallService = runtime.services.get(
+        "recall" as ServiceType
+      ) as RecallService;
+      const res = await recallService.provideKnowledge(message);
+      return JSON.stringify(res, null, 2);
+    } catch (error) {
+      return error instanceof Error
+        ? error.message
+        : "Unable to get storage provider";
+    }
+  },
+};
