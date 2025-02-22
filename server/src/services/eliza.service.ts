@@ -634,6 +634,7 @@ export class ElizaService extends BaseService {
 
       const service = new RecallService(this.runtime);
       await service.initialize(this.runtime);
+      this.runtime.registerService(service);
       elizaLogger.info("Recall service started successfully", service);
     } catch (err) {
       elizaLogger.warn("[eliza] gated storage service is unavailable");

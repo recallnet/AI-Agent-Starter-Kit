@@ -548,6 +548,95 @@ export class RecallService extends Service {
   }
 
   /**
+   * Validates a memory's embedding and logs details about its state.
+   * @param memory The memory to validate
+   * @param context A string describing where the validation is happening
+   * @returns true if the embedding is valid, false otherwise
+   */
+  private validateEmbedding(
+    memory: Memory | null | undefined,
+    context: string
+  ): boolean {
+    if (!memory) {
+      elizaLogger.debug(
+        `Validation failed at ${context}: memory is null or undefined`
+      );
+      return false;
+    }
+
+    const validation = {
+      memoryExists: true,
+      hasEmbeddingProperty: "embedding" in memory,
+      embeddingDefined: !!memory.embedding,
+      isArray: false,
+      hasLength: false,
+      isNumberArray: false,
+      context,
+      memoryId: memory.id || "unknown",
+    };
+
+    try {
+      // Handle string embeddings by parsing them
+      if (typeof memory.embedding === "string") {
+        try {
+          memory.embedding = JSON.parse(memory.embedding);
+        } catch (e) {
+          elizaLogger.error(
+            `Failed to parse embedding string at ${context}: ${e.message}`
+          );
+          return false;
+        }
+      }
+
+      // Update validation status
+      validation.isArray = Array.isArray(memory.embedding) || false;
+      validation.hasLength =
+        (validation.isArray &&
+          memory.embedding &&
+          memory.embedding.length > 0) ||
+        false;
+      validation.isNumberArray =
+        (validation.hasLength &&
+          memory.embedding &&
+          memory.embedding.every((n) => typeof n === "number")) ||
+        false;
+
+      const isValid =
+        validation.memoryExists &&
+        validation.hasEmbeddingProperty &&
+        validation.embeddingDefined &&
+        validation.isArray &&
+        validation.hasLength &&
+        validation.isNumberArray;
+
+      // Log validation results
+      if (!isValid) {
+        elizaLogger.debug(
+          `Embedding validation failed at ${context} for memory ${validation.memoryId}`,
+          {
+            validationResults: validation,
+            failureReason: {
+              noMemory: !validation.memoryExists,
+              noEmbeddingProperty: !validation.hasEmbeddingProperty,
+              embeddingUndefined: !validation.embeddingDefined,
+              notArray: !validation.isArray,
+              emptyArray: !validation.hasLength,
+              notNumberArray: !validation.isNumberArray,
+            },
+          }
+        );
+      }
+
+      return isValid;
+    } catch (error) {
+      elizaLogger.error(
+        `Error during embedding validation at ${context}: ${error.message}`
+      );
+      return false;
+    }
+  }
+
+  /**
    * Prepares memories for storage by ensuring they have embeddings.
    * @param memories Array of memories to prepare
    * @returns Array of prepared memories with embeddings
@@ -558,20 +647,144 @@ export class RecallService extends Service {
     const preparedMemories: Memory[] = [];
 
     for (const memory of memories) {
-      // Skip if already has embedding
-      if (memory.embedding && memory.embedding.length > 0) {
-        preparedMemories.push(memory);
-        continue;
-      }
-
       try {
-        // Add embedding if missing
-        const memoryWithEmbedding =
-          await this.runtime.messageManager.addEmbeddingToMemory(memory);
-        preparedMemories.push(memoryWithEmbedding);
+        // Initial validation check
+        const initialValidation = this.validateEmbedding(
+          memory,
+          "initial check"
+        );
+        elizaLogger.info(`Processing memory ${memory.id}`, {
+          hasValidEmbedding: initialValidation,
+          embeddingLength: memory.embedding?.length,
+        });
+
+        if (initialValidation && memory.embedding) {
+          // Check that embedding exists
+          // Memory already has valid embedding, make a deep copy
+          const preparedMemory = {
+            ...memory,
+            embedding: Array.isArray(memory.embedding)
+              ? [...memory.embedding]
+              : [],
+          };
+
+          // Verify copy was successful
+          if (this.validateEmbedding(preparedMemory, "after copy")) {
+            preparedMemories.push(preparedMemory);
+            elizaLogger.info(
+              `Using existing embedding for memory ${memory.id}`,
+              {
+                embeddingLength: preparedMemory.embedding.length,
+              }
+            );
+            continue;
+          } else {
+            elizaLogger.warn(
+              `Failed to copy embedding for memory ${memory.id}, will try to generate new one`
+            );
+          }
+        }
+
+        // Need to generate new embedding
+        elizaLogger.info(`Generating new embedding for memory ${memory.id}`);
+
+        // Create a clean copy without any existing embedding
+        const memoryForEmbedding = {
+          ...memory,
+          embedding: undefined,
+          id: memory.id || stringToUuid(randomUUID()),
+        };
+
+        // Try to generate embedding with retries
+        let attemptsLeft = 3;
+        let embeddingSuccess = false;
+        let generatedMemory: Memory = memoryForEmbedding;
+
+        while (attemptsLeft > 0 && !embeddingSuccess) {
+          try {
+            const result =
+              await this.runtime.messageManager.addEmbeddingToMemory(
+                memoryForEmbedding
+              );
+
+            if (result && this.validateEmbedding(result, "after generation")) {
+              generatedMemory = result;
+              embeddingSuccess = true;
+              break;
+            }
+
+            attemptsLeft--;
+            if (attemptsLeft > 0) {
+              elizaLogger.warn(
+                `Invalid embedding generated for memory ${memory.id}, ${attemptsLeft} attempts remaining`
+              );
+              await new Promise((resolve) => setTimeout(resolve, 1000));
+            }
+          } catch (embedError) {
+            attemptsLeft--;
+            if (attemptsLeft > 0) {
+              elizaLogger.warn(
+                `Error generating embedding for memory ${memory.id}, ${attemptsLeft} attempts remaining: ${embedError.message}`
+              );
+              await new Promise((resolve) => setTimeout(resolve, 1000));
+            } else {
+              throw embedError;
+            }
+          }
+        }
+
+        // Check if we succeeded in generating a valid embedding
+        if (
+          embeddingSuccess &&
+          this.validateEmbedding(generatedMemory, "final validation")
+        ) {
+          preparedMemories.push(generatedMemory);
+          elizaLogger.info(
+            `Successfully added new embedding to memory ${memory.id}`,
+            {
+              embeddingLength: generatedMemory.embedding?.length,
+            }
+          );
+        } else {
+          throw new Error(
+            `Failed to generate valid embedding for memory ${memory.id} after all attempts`
+          );
+        }
       } catch (error) {
-        elizaLogger.error(`Error adding embedding to memory: ${error.message}`);
+        elizaLogger.error(
+          `Failed to prepare memory ${memory.id}: ${error.message}`,
+          {
+            error,
+            stack: error.stack,
+            memoryContent:
+              typeof memory.content === "string"
+                ? "string content"
+                : memory.content,
+          }
+        );
       }
+    }
+
+    // Log overall results
+    elizaLogger.info(`Memory preparation complete`, {
+      total: memories.length,
+      prepared: preparedMemories.length,
+      successRate: `${((preparedMemories.length / memories.length) * 100).toFixed(1)}%`,
+    });
+
+    // Final validation of all prepared memories
+    const invalidMemories = preparedMemories.filter(
+      (memory) => !this.validateEmbedding(memory, "final batch check")
+    );
+
+    if (invalidMemories.length > 0) {
+      const error = new Error(
+        `${invalidMemories.length} memories have invalid embeddings after preparation`
+      );
+      elizaLogger.error(error.message, {
+        invalidMemoryIds: invalidMemories.map((m) => m.id),
+      });
+      throw error;
     }
 
     return preparedMemories;
@@ -592,62 +805,117 @@ export class RecallService extends Service {
       const nextKnowledgeKey = `${this.prefix}${timestamp}.parquet`;
 
       // Ensure all memories have embeddings
+      elizaLogger.info(`Preparing ${batch.length} memories for storage`);
       const preparedMemories = await this.prepareMemoriesForStorage(batch);
+
+      // Verify all prepared memories have embeddings
+      const missingEmbeddings = preparedMemories.filter(
+        (memory) =>
+          !memory.embedding ||
+          !Array.isArray(memory.embedding) ||
+          memory.embedding.length === 0
+      );
+
+      if (missingEmbeddings.length > 0) {
+        elizaLogger.error(
+          `${missingEmbeddings.length} memories still missing embeddings after preparation`,
+          {
+            memoryIds: missingEmbeddings.map((m) => m.id),
+          }
+        );
+        return undefined;
+      }
+
       if (preparedMemories.length === 0) {
         elizaLogger.warn("No valid memories to store after preparation.");
         return undefined;
       }
 
       // Transform to the expected format for Chain of Thought logs
-      // This matches the format we read from existing Parquet files
       elizaLogger.info(
         `Transforming ${preparedMemories.length} memories to Chain of Thought format`
       );
       const cotRecords = preparedMemories.map((memory) => {
+        // Log the memory structure before transformation
+        elizaLogger.debug(`Memory pre-transform:`, {
+          id: memory.id,
+          hasEmbedding: !!memory.embedding,
+          embeddingLength: memory.embedding?.length,
+        });
+
         // Extract text from content object or handle string content
         const text =
           typeof memory.content === "string"
             ? memory.content
             : memory.content.text || "";
 
-        // Log record structure for debugging
         elizaLogger.debug(
           `Creating COT record from memory ID=${memory.id}, roomId=${memory.roomId}`
         );
 
+        if (!memory.embedding || !Array.isArray(memory.embedding)) {
+          throw new Error(
+            `Memory ${memory.id} has invalid embedding during transformation`
+          );
+        }
+
         // Create a record matching the Chain of Thought format
-        return {
+        const record = {
           userId: memory.userId || "",
           agentId: memory.agentId || "",
           userMessage: text, // Store content as userMessage
           log: text, // Also store in log for redundancy
-          embedding: Array.isArray(memory.embedding) ? memory.embedding : [],
+          embedding: [...memory.embedding], // Make a copy of the embedding array
           timestamp: memory.createdAt
             ? new Date(memory.createdAt).toISOString()
             : new Date().toISOString(),
         };
+
+        // Log the record after transformation
+        elizaLogger.debug(`Chain of Thought record created:`, {
+          userId: record.userId,
+          hasEmbedding: Array.isArray(record.embedding),
+          embeddingLength: record.embedding?.length,
+          recordKeys: Object.keys(record),
+        });
+
+        return record;
       });
 
-      if (cotRecords.length === 0) {
-        elizaLogger.warn("No valid Chain of Thought records to store.");
+      // Verify all records have valid embeddings before proceeding
+      const withoutEmbeddings = cotRecords.filter(
+        (record) =>
+          !record.embedding ||
+          !Array.isArray(record.embedding) ||
+          record.embedding.length === 0
+      );
+
+      if (withoutEmbeddings.length > 0) {
+        elizaLogger.error(
+          `${withoutEmbeddings.length} records missing embeddings before Parquet creation`,
+          {
+            records: withoutEmbeddings.map((r) => ({
+              userId: r.userId,
+              hasEmbedding: !!r.embedding,
+              embeddingLength: r.embedding?.length,
+            })),
+          }
+        );
         return undefined;
       }
 
       // More detailed logging around Parquet creation
       elizaLogger.info(
-        `Attempting to create Parquet buffer for ${cotRecords.length} records`
+        `Attempting to create Parquet buffer for ${cotRecords.length} records with structure:`,
+        {
+          sampleKeys: Object.keys(cotRecords[0]),
+          hasSampleEmbedding: !!cotRecords[0].embedding,
+          sampleEmbeddingLength: cotRecords[0].embedding?.length,
+        }
       );
 
       try {
-        // Make sure the writeParquetToBuffer function is properly imported
-        if (typeof writeParquetToBuffer !== "function") {
-          elizaLogger.error("writeParquetToBuffer is not a function", {
-            type: typeof writeParquetToBuffer,
-          });
-          return undefined;
-        }
-
-        // Create the Parquet buffer - make sure it matches the expected format
+        // Create the Parquet schema to match the CoT format
         const parquetBuffer = await writeParquetToBuffer(cotRecords);
 
         if (!parquetBuffer) {
@@ -1105,14 +1373,8 @@ export class RecallService extends Service {
     threshold = 0.7
   ): Promise<KnowledgeItem[]> {
     try {
-      // If no room IDs provided, query across all rooms the agent participates in
-      if (!roomIds || roomIds.length === 0) {
-        roomIds = await this.runtime.databaseAdapter.getRoomsForParticipant(
-          this.runtime.agentId
-        );
-      }
-
-      if (!roomIds || roomIds.length === 0) {
+      // First check if roomIds exists and has items
+      if (!roomIds?.length) {
         elizaLogger.info("No rooms available for knowledge query.");
         return [];
       }
@@ -1129,19 +1391,31 @@ export class RecallService extends Service {
       }
 
       const queryEmbeddingArray = `ARRAY[${queryEmbedding.join(",")}]`;
-      const roomIdsPlaceholders = roomIds.map(() => "?").join(",");
+      const roomIdsPlaceholders = roomIds.map(() => "?").join(","); // Generates ?,?,? dynamically
+      const queryParams = [queryEmbeddingArray, ...roomIds, threshold, limit];
+
+      elizaLogger.debug("Executing DuckDB Query", {
+        query: `SELECT id, userId, agentId, content, roomId, createdAt,
+          1 - (embedding <-> ?) AS similarity 
+          FROM knowledge 
+          WHERE roomId IN (${roomIdsPlaceholders}) 
+          AND similarity > ? 
+          ORDER BY similarity DESC 
+          LIMIT ?;`,
+        params: queryParams,
+      });
 
       // Query across all specified rooms
       const searchResults: AnyType[] = await new Promise((resolve, reject) => {
         this.db.all(
           `SELECT id, userId, agentId, content, roomId, createdAt,
-              1 - (embedding <-> ${queryEmbeddingArray}) AS similarity 
+              1 - (embedding <-> ?) AS similarity 
            FROM knowledge 
-           WHERE roomId IN (${roomIdsPlaceholders}) AND similarity > ?
+           WHERE roomId IN (${roomIdsPlaceholders}) 
+           AND similarity > ? 
            ORDER BY similarity DESC 
            LIMIT ?;`,
-          // @ts-expect-error test
-          [...roomIds, threshold, limit],
+          queryParams, // ✅ Correctly passing parameters
           (err, res) => {
             if (err) reject(err);
             else resolve(res || []);
