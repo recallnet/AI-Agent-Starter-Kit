@@ -1390,42 +1390,45 @@ export class RecallService extends Service {
         return [];
       }
 
-      const queryEmbeddingArray = `ARRAY[${queryEmbedding.join(",")}]`;
-      const roomIdsPlaceholders = roomIds.map(() => "?").join(","); // Generates ?,?,? dynamically
-      const queryParams = [queryEmbeddingArray, ...roomIds, threshold, limit];
+      const queryEmbeddingArray = `ARRAY[${[...queryEmbedding].join(",")}]`; // ✅ Inline embedding
 
-      elizaLogger.debug("Executing DuckDB Query", {
-        query: `SELECT id, userId, agentId, content, roomId, createdAt,
-          1 - (embedding <-> ?) AS similarity 
-          FROM knowledge 
-          WHERE roomId IN (${roomIdsPlaceholders}) 
-          AND similarity > ? 
-          ORDER BY similarity DESC 
-          LIMIT ?;`,
-        params: queryParams,
-      });
+      const roomIdsList = roomIds.map((id) => `'${id}'`).join(","); // ✅ Convert to SQL-friendly format
+
+      const query = `
+  SELECT id, userId, agentId, content, roomId, createdAt,
+      1 - (embedding <-> ${queryEmbeddingArray}) AS similarity 
+  FROM knowledge 
+  WHERE roomId IN (${roomIdsList})  -- ✅ Fully inlined values
+  AND similarity > ${threshold || 0.7}
+  ORDER BY similarity DESC 
+  LIMIT ${limit || 10};
+`;
+
+      elizaLogger.debug("Executing DuckDB Query", { query });
 
       // Query across all specified rooms
       const searchResults: AnyType[] = await new Promise((resolve, reject) => {
-        this.db.all(
-          `SELECT id, userId, agentId, content, roomId, createdAt,
-              1 - (embedding <-> ?) AS similarity 
-           FROM knowledge 
-           WHERE roomId IN (${roomIdsPlaceholders}) 
-           AND similarity > ? 
-           ORDER BY similarity DESC 
-           LIMIT ?;`,
-          queryParams, // ✅ Correctly passing parameters
-          (err, res) => {
-            if (err) reject(err);
-            else resolve(res || []);
+        this.db.all(query, (err, res) => {
+          if (err) {
+            elizaLogger.error(
+              `⛔ Error executing DuckDB query: ${err.message}`,
+              { query }
+            );
+            reject(err);
+          } else {
+            resolve(res || []);
           }
-        );
+        });
       });
 
       if (!searchResults || searchResults.length === 0) {
         elizaLogger.info("No matching knowledge found across specified rooms.");
         return [];
+      } else {
+        elizaLogger.info(
+          `Found ${searchResults.length} matching knowledge items.`
+        );
+        elizaLogger.info(`First item: ${searchResults[0].content}`);
       }
 
       // Transform results into KnowledgeItem format
