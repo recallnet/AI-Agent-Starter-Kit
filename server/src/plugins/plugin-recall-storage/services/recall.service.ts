@@ -598,42 +598,57 @@ export class RecallService extends Service {
         return undefined;
       }
 
-      // Process memories for Parquet format - add more debugging
-      const knowledgeRecords = preparedMemories.map((memory) => {
-        const contentStr =
+      // Transform to the expected format for Chain of Thought logs
+      // This matches the format we read from existing Parquet files
+      elizaLogger.info(
+        `Transforming ${preparedMemories.length} memories to Chain of Thought format`
+      );
+      const cotRecords = preparedMemories.map((memory) => {
+        // Extract text from content object or handle string content
+        const text =
           typeof memory.content === "string"
             ? memory.content
-            : JSON.stringify(memory.content);
+            : memory.content.text || "";
 
+        // Log record structure for debugging
         elizaLogger.debug(
-          `Processing memory for Parquet: ID=${memory.id}, embedding length=${memory.embedding?.length || 0}`
+          `Creating COT record from memory ID=${memory.id}, roomId=${memory.roomId}`
         );
 
+        // Create a record matching the Chain of Thought format
         return {
-          id: memory.id || stringToUuid(randomUUID()),
           userId: memory.userId || "",
           agentId: memory.agentId || "",
-          content: contentStr,
+          userMessage: text, // Store content as userMessage
+          log: text, // Also store in log for redundancy
           embedding: Array.isArray(memory.embedding) ? memory.embedding : [],
-          roomId: memory.roomId || "",
-          createdAt: memory.createdAt
+          timestamp: memory.createdAt
             ? new Date(memory.createdAt).toISOString()
             : new Date().toISOString(),
         };
       });
 
-      if (knowledgeRecords.length === 0) {
-        elizaLogger.warn("No valid knowledge records to store.");
+      if (cotRecords.length === 0) {
+        elizaLogger.warn("No valid Chain of Thought records to store.");
         return undefined;
       }
 
       // More detailed logging around Parquet creation
       elizaLogger.info(
-        `Attempting to create Parquet buffer for ${knowledgeRecords.length} records`
+        `Attempting to create Parquet buffer for ${cotRecords.length} records`
       );
+
       try {
-        // Directly handle any errors from writeParquetToBuffer
-        const parquetBuffer = await writeParquetToBuffer(knowledgeRecords);
+        // Make sure the writeParquetToBuffer function is properly imported
+        if (typeof writeParquetToBuffer !== "function") {
+          elizaLogger.error("writeParquetToBuffer is not a function", {
+            type: typeof writeParquetToBuffer,
+          });
+          return undefined;
+        }
+
+        // Create the Parquet buffer - make sure it matches the expected format
+        const parquetBuffer = await writeParquetToBuffer(cotRecords);
 
         if (!parquetBuffer) {
           elizaLogger.error("writeParquetToBuffer returned undefined");
@@ -672,7 +687,7 @@ export class RecallService extends Service {
         }
 
         elizaLogger.info(
-          `Successfully stored batch of ${knowledgeRecords.length} memories at key: ${nextKnowledgeKey}`
+          `Successfully stored batch of ${cotRecords.length} records at key: ${nextKnowledgeKey}`
         );
         return nextKnowledgeKey;
       } catch (parquetError) {
@@ -1313,6 +1328,7 @@ export class RecallService extends Service {
     }
   }
 
+  // 2. Fix the processing of existing Parquet files
   /**
    * Retrieves and processes a specific knowledge file from Recall.
    * @param bucketAddress The bucket address containing the file.
@@ -1371,48 +1387,64 @@ export class RecallService extends Service {
           );
         }
 
-        // Check if we have required fields from Chain of Thought logs
-        if (!record.userId || !record.agentId || !record.embedding) {
+        // Extract data from Chain of Thought record - more permissive checking
+        const userId = record.userId;
+        const agentId = record.agentId;
+        const embedding = record.embedding;
+
+        // Skip records that are definitely missing critical fields
+        if (!userId || !agentId || !embedding || !Array.isArray(embedding)) {
           elizaLogger.warn(
-            `Incomplete record found in ${knowledgeFile}, skipping`,
+            `Record missing critical fields in ${knowledgeFile}, skipping`,
             {
               recordKeys: Object.keys(record),
+              hasUserId: !!userId,
+              hasAgentId: !!agentId,
+              hasEmbedding: !!embedding && Array.isArray(embedding),
             }
           );
           continue;
         }
 
         try {
-          // Map the fields from Chain of Thought logs to our Memory structure
-          // We're adapting from the CoT format to Memory format
-          const content: Content = {
-            text: record.userMessage || record.log || "",
-          };
+          // Get text content from either userMessage or log field
+          const messageText = record.userMessage || "";
+          const logText = record.log || "";
+          const text = messageText || logText || "No content available";
 
-          // Generate a deterministic ID if not present
-          const memoryId = stringToUuid(
-            `${record.userId}-${record.agentId}-${record.timestamp || Date.now()}`
-          );
+          // Create Content object
+          const content: Content = { text };
 
-          // Get the room ID from the record or use a synthetic one
-          // Since your CoT logs don't have roomId, we'll create one from userId+agentId
-          const roomId = stringToUuid(
-            `room-${record.userId}-${record.agentId}`
-          );
+          // Generate a deterministic ID based on record data
+          const idBase = `${userId}-${agentId}-${record.timestamp || Date.now()}`;
+          const memoryId = stringToUuid(idBase);
 
-          // Create a timestamp from the record's timestamp field
-          const timestamp = record.timestamp
-            ? new Date(record.timestamp).getTime()
-            : Date.now();
+          // Create a room ID from userId and agentId
+          const roomId = stringToUuid(`room-${userId}-${agentId}`);
+
+          // Convert timestamp string to number if available
+          let timestamp: number;
+          try {
+            // Try to parse the timestamp if it exists
+            timestamp = record.timestamp
+              ? new Date(record.timestamp).getTime()
+              : Date.now();
+          } catch (e) {
+            // Fall back to current time if parsing fails
+            timestamp = Date.now();
+            elizaLogger.warn(
+              `Failed to parse timestamp in record: ${e.message}`
+            );
+          }
 
           // Convert record to Memory format
           const memoryRecord: Memory = {
             id: memoryId,
-            userId: record.userId,
-            agentId: record.agentId,
-            content: content,
-            embedding: record.embedding,
-            roomId: roomId,
+            userId,
+            agentId,
+            content,
+            embedding,
+            roomId,
             createdAt: timestamp,
           };
 
@@ -1420,9 +1452,12 @@ export class RecallService extends Service {
           await this.insertKnowledgeIntoDuckDB(memoryRecord, knowledgeFile);
         } catch (recordError) {
           elizaLogger.error(
-            `Error processing record in ${knowledgeFile}: ${recordError.message}`
+            `Error processing record in ${knowledgeFile}: ${recordError.message}`,
+            {
+              error: recordError,
+              stack: recordError.stack,
+            }
           );
-          // Continue processing other records
           continue;
         }
       }
