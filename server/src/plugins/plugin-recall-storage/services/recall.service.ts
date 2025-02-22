@@ -114,7 +114,7 @@ export class RecallService extends Service {
 
   getInstance(): RecallService {
     elizaLogger.info("RecallService.getInstance() called");
-    return RecallService.getInstance();
+    return this;
   }
 
   constructor(_runtime: IAgentRuntime) {
@@ -273,6 +273,7 @@ export class RecallService extends Service {
       // Start periodic sync
       elizaLogger.info("Starting periodic sync");
       try {
+        await this.loadLastSyncTime(); // ✅ Load from Recall before starting sync
         this.startPeriodicSync(this.intervalMs, this.batchSizeKB);
         elizaLogger.info("Periodic sync started successfully");
       } catch (syncError) {
@@ -831,9 +832,8 @@ export class RecallService extends Service {
         return undefined;
       }
 
-      // Transform to the expected format for Chain of Thought logs
       elizaLogger.info(
-        `Transforming ${preparedMemories.length} memories to Chain of Thought format`
+        `Transforming ${preparedMemories.length} memories to knowledge format`
       );
       const cotRecords = preparedMemories.map((memory) => {
         // Log the memory structure before transformation
@@ -859,7 +859,6 @@ export class RecallService extends Service {
           );
         }
 
-        // Create a record matching the Chain of Thought format
         const record = {
           userId: memory.userId || "",
           agentId: memory.agentId || "",
@@ -872,7 +871,7 @@ export class RecallService extends Service {
         };
 
         // Log the record after transformation
-        elizaLogger.debug(`Chain of Thought record created:`, {
+        elizaLogger.debug(`Knowledge record created:`, {
           userId: record.userId,
           hasEmbedding: Array.isArray(record.embedding),
           embeddingLength: record.embedding?.length,
@@ -948,8 +947,13 @@ export class RecallService extends Service {
 
         if (!addObject?.meta?.tx) {
           elizaLogger.error(
-            "Recall API returned invalid response for batch storage",
-            { response: JSON.stringify(addObject) }
+            "❌ Recall API returned invalid response for batch storage",
+            {
+              response: JSON.stringify(addObject),
+              bucket: bucketAddress,
+              key: nextKnowledgeKey,
+              batchSize: preparedMemories.length,
+            }
           );
           return undefined;
         }
@@ -978,6 +982,37 @@ export class RecallService extends Service {
   }
 
   /**
+   * Saves the last sync time to Recall.
+   * @returns A promise that resolves when the time is saved.
+   */
+
+  private async saveLastSyncTime(): Promise<void> {
+    try {
+      const lastSyncData = new TextEncoder().encode(
+        JSON.stringify({ lastSyncTime: this.lastSyncTime })
+      );
+
+      await this.client.bucketManager().add(
+        await this.getOrCreateBucket(this.alias),
+        "lastSyncTime.json",
+        lastSyncData, // ✅ Now properly encoded as Uint8Array
+        { overwrite: true }
+      );
+
+      elizaLogger.info(`📝 Saved lastSyncTime in Recall: ${this.lastSyncTime}`);
+    } catch (error) {
+      elizaLogger.error(
+        `❌ Error saving lastSyncTime in Recall: ${error.message}`
+      );
+    }
+  }
+
+  /**
+   * Syncs knowledge to Recall in batches.
+   * @param bucketAlias The alias of the bucket to store knowledge.
+   * @param batchSizeKB The maximum size of each batch in kilobytes.
+   */
+  /**
    * Syncs knowledge to Recall in batches.
    * @param bucketAlias The alias of the bucket to store knowledge.
    * @param batchSizeKB The maximum size of each batch in kilobytes.
@@ -988,57 +1023,55 @@ export class RecallService extends Service {
   ): Promise<void> {
     try {
       const currentTime = Date.now();
-
-      // Get bucket address
       const bucketAddress = await this.withTimeout(
         this.getOrCreateBucket(bucketAlias),
         15000,
         "Get/Create bucket"
       );
-
-      // Since we don't have direct access to all rooms, we'll use a different approach:
-      // Get unsynced memories since the last sync time
       const unsyncedMemories = await this.getUnsyncedMemories(
         this.lastSyncTime,
         currentTime
       );
 
       if (!unsyncedMemories || unsyncedMemories.length === 0) {
-        elizaLogger.info("No new memories found for synchronization.");
+        elizaLogger.info("📭 No new memories found for synchronization.");
         return;
       }
 
-      elizaLogger.info(`Found ${unsyncedMemories.length} new memories to sync`);
+      elizaLogger.info(
+        `📥 Found ${unsyncedMemories.length} new memories to sync`
+      );
 
-      // Group memories by roomId for better logging and organization
+      // Group memories by roomId for better organization
       const memoriesByRoom = this.groupMemoriesByRoom(unsyncedMemories);
 
       let syncedCount = 0;
-      const totalMemoriesFound = unsyncedMemories.length;
+      let successfullySynced = false; // ✅ Only update `lastSyncTime` if at least one batch is stored
 
-      // Process each room's memories
       for (const [roomId, memories] of Object.entries(memoriesByRoom)) {
         try {
           elizaLogger.info(
-            `Processing ${memories.length} memories for room ${roomId}`
+            `📂 Processing ${memories.length} memories for room ${roomId}`
           );
 
-          // Process memories in batches
           let batch: Memory[] = [];
           let batchSize = 0;
 
           for (const memory of memories) {
-            // Serialize the memory to estimate its size
             const memoryStr = JSON.stringify(memory);
             const memorySize = new TextEncoder().encode(memoryStr).length;
 
-            // If adding this memory would exceed the batch size, store the current batch
+            elizaLogger.debug(
+              `📏 Memory ID=${memory.id}, Size=${memorySize} bytes`
+            );
+
+            // If adding this memory exceeds the 4KB batch size, sync the existing batch first
             if (
               batchSize + memorySize > batchSizeKB * 1024 &&
               batch.length > 0
             ) {
               elizaLogger.info(
-                `Batch size limit reached (${batchSize} bytes). Uploading batch of ${batch.length} memories...`
+                `📤 Batch size limit reached (${batchSize} bytes). Uploading batch of ${batch.length} memories...`
               );
 
               const knowledgeFileKey = await this.storeBatchToRecall(
@@ -1047,21 +1080,20 @@ export class RecallService extends Service {
               );
 
               if (knowledgeFileKey) {
-                // Insert into local DuckDB for each memory in the batch
                 for (const syncedMemory of batch) {
                   await this.insertKnowledgeIntoDuckDB(
                     syncedMemory,
                     knowledgeFileKey
                   );
                 }
-
                 syncedCount += batch.length;
-                elizaLogger.info(
-                  `Successfully synced batch of ${batch.length} memories`
+                successfullySynced = true; // ✅ Mark sync as successful
+                elizaLogger.success(
+                  `✅ Successfully synced batch of ${batch.length} memories (${batchSize} bytes)`
                 );
               } else {
                 elizaLogger.warn(
-                  `Failed to sync batch of ${batch.length} memories - will retry on next sync`
+                  `⚠️ Failed to sync batch of ${batch.length} memories - will retry on next sync`
                 );
               }
 
@@ -1070,62 +1102,111 @@ export class RecallService extends Service {
               batchSize = 0;
             }
 
-            // Add memory to current batch
             batch.push(memory);
             batchSize += memorySize;
           }
 
-          // Process any remaining memories in the batch
+          // Handle final batch (only if it’s large enough)
           if (batch.length > 0) {
-            elizaLogger.info(
-              `Processing final batch of ${batch.length} memories (${batchSize} bytes)...`
-            );
-
-            const knowledgeFileKey = await this.storeBatchToRecall(
-              bucketAddress,
-              batch
-            );
-
-            if (knowledgeFileKey) {
-              // Insert into local DuckDB for each memory in the batch
-              for (const syncedMemory of batch) {
-                await this.insertKnowledgeIntoDuckDB(
-                  syncedMemory,
-                  knowledgeFileKey
-                );
-              }
-
-              syncedCount += batch.length;
+            if (batchSize < batchSizeKB * 1024) {
               elizaLogger.info(
-                `Successfully synced final batch of ${batch.length} memories`
+                `🔄 Final batch (${batchSize} bytes) is below 4KB threshold. Holding until next sync.`
               );
             } else {
-              elizaLogger.warn(
-                `Failed to sync final batch of ${batch.length} memories - will retry on next sync`
+              elizaLogger.info(
+                `📤 Uploading final batch of ${batch.length} memories (${batchSize} bytes)...`
               );
+
+              const knowledgeFileKey = await this.storeBatchToRecall(
+                bucketAddress,
+                batch
+              );
+
+              if (knowledgeFileKey) {
+                for (const syncedMemory of batch) {
+                  await this.insertKnowledgeIntoDuckDB(
+                    syncedMemory,
+                    knowledgeFileKey
+                  );
+                }
+                syncedCount += batch.length;
+                successfullySynced = true; // ✅ Mark sync as successful
+                elizaLogger.success(
+                  `✅ Successfully synced final batch of ${batch.length} memories`
+                );
+              } else {
+                elizaLogger.warn(
+                  `⚠️ Failed to sync final batch of ${batch.length} memories - will retry on next sync`
+                );
+              }
             }
           }
         } catch (error) {
           elizaLogger.error(
-            `Error processing memories for room ${roomId}: ${error.message}`
+            `❌ Error processing memories for room ${roomId}: ${error.message}`
           );
         }
       }
 
-      // Update last sync time if we successfully found and processed memories
-      if (totalMemoriesFound > 0) {
+      // ✅ Only update lastSyncTime if we successfully synced at least one batch
+      if (successfullySynced) {
         this.lastSyncTime = currentTime;
+        await this.saveLastSyncTime();
+      } else {
+        elizaLogger.warn(
+          `⚠️ No batches met the size threshold. Last sync time remains: ${this.lastSyncTime}`
+        );
       }
 
       elizaLogger.info(
-        `Sync cycle complete. Synced ${syncedCount}/${totalMemoriesFound} memories. Next sync in ${this.intervalMs / 1000} seconds.`
+        `🔄 Sync cycle complete. Synced ${syncedCount}/${unsyncedMemories.length} memories. Next sync in ${this.intervalMs / 1000} seconds.`
       );
     } catch (error) {
       if (error.message.includes("timed out")) {
-        elizaLogger.error(`Recall sync operation timed out: ${error.message}`);
+        elizaLogger.error(
+          `⏳ Recall sync operation timed out: ${error.message}`
+        );
       } else {
-        elizaLogger.error(`Error in syncKnowledgeToRecall: ${error.message}`);
+        elizaLogger.error(
+          `❌ Error in syncKnowledgeToRecall: ${error.message}`
+        );
       }
+    }
+  }
+
+  /**
+   * Loads the last sync time from Recall.
+   * @returns A promise that resolves when the time is loaded.
+   */
+
+  private async loadLastSyncTime(): Promise<void> {
+    try {
+      const bucketAddress = await this.getOrCreateBucket(this.alias);
+      const recallData = await this.client
+        .bucketManager()
+        .get(bucketAddress, "lastSyncTime.json");
+
+      if (recallData.result) {
+        const data = JSON.parse(new TextDecoder().decode(recallData.result));
+        if (typeof data.lastSyncTime === "number" && data.lastSyncTime > 0) {
+          this.lastSyncTime = data.lastSyncTime;
+          elizaLogger.info(
+            `📂 Loaded lastSyncTime from Recall: ${this.lastSyncTime}`
+          );
+        } else {
+          throw new Error("Invalid lastSyncTime format, resetting to 0");
+        }
+      } else {
+        elizaLogger.warn(
+          "⚠️ No lastSyncTime found in Recall. Defaulting to 0."
+        );
+        this.lastSyncTime = 0;
+      }
+    } catch (error) {
+      elizaLogger.error(
+        `❌ Error loading lastSyncTime from Recall: ${error.message}`
+      );
+      this.lastSyncTime = 0;
     }
   }
 
@@ -1573,25 +1654,36 @@ export class RecallService extends Service {
     elizaLogger.info(
       `Starting periodic knowledge sync (every ${intervalMs / 1000}s)...`
     );
+
     this.syncInterval = setInterval(async () => {
       try {
-        // First retrieve and process any new knowledge files
+        // Step 1: Retrieve and process new knowledge files first
         await this.retrieveAndProcessKnowledgeFiles(this.alias);
 
-        // Then sync any new memories to Recall
+        // Step 2: Only after retrieving, sync new memories to Recall
         await this.syncKnowledgeToRecall(this.alias, batchSizeKB);
+
+        elizaLogger.info("Periodic knowledge sync completed successfully.");
       } catch (error) {
-        elizaLogger.error(`Periodic knowledge sync failed: ${error.message}`);
+        elizaLogger.error(`Periodic knowledge sync failed: ${error.message}`, {
+          stack: error.stack,
+        });
       }
     }, intervalMs);
 
-    // Perform an immediate sync on startup
-    Promise.all([
-      this.retrieveAndProcessKnowledgeFiles(this.alias),
-      this.syncKnowledgeToRecall(this.alias, batchSizeKB),
-    ]).catch((error) =>
-      elizaLogger.error(`Initial knowledge sync failed: ${error.message}`)
-    );
+    // Perform an immediate sync on startup, sequentially
+    (async () => {
+      try {
+        elizaLogger.info("Performing initial sync...");
+        await this.retrieveAndProcessKnowledgeFiles(this.alias);
+        await this.syncKnowledgeToRecall(this.alias, batchSizeKB);
+        elizaLogger.info("Initial knowledge sync completed.");
+      } catch (error) {
+        elizaLogger.error(`Initial knowledge sync failed: ${error.message}`, {
+          stack: error.stack,
+        });
+      }
+    })();
   }
 
   /**
@@ -1664,7 +1756,6 @@ export class RecallService extends Service {
           );
         }
 
-        // Extract data from Chain of Thought record - more permissive checking
         const userId = record.userId;
         const agentId = record.agentId;
         const embedding = record.embedding;
