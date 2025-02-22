@@ -79,7 +79,7 @@ export type KnowledgeItem = {
 // Load environment variables with detailed logging
 const privateKey = process.env.RECALL_PRIVATE_KEY as Hex;
 const envAlias = process.env.RECALL_BUCKET_ALIAS as string;
-const envPrefix = process.env.RECALL_COT_LOG_PREFIX as string;
+const envPrefix = process.env.RECALL_MEMORY_PREFIX as string;
 const network = process.env.RECALL_NETWORK as string;
 const intervalPeriod = process.env.RECALL_SYNC_INTERVAL as string;
 const batchSize = process.env.RECALL_BATCH_SIZE as string;
@@ -88,7 +88,7 @@ const batchSize = process.env.RECALL_BATCH_SIZE as string;
 elizaLogger.info("Environment configuration:", {
   RECALL_PRIVATE_KEY: privateKey ? "[REDACTED]" : undefined,
   RECALL_BUCKET_ALIAS: envAlias,
-  RECALL_COT_LOG_PREFIX: envPrefix,
+  RECALL_MEMORY_PREFIX: envPrefix,
   RECALL_NETWORK: network,
   RECALL_SYNC_INTERVAL: intervalPeriod,
   RECALL_BATCH_SIZE: batchSize,
@@ -162,8 +162,8 @@ export class RecallService extends Service {
         throw new Error("RECALL_BUCKET_ALIAS is required");
       }
       if (!envPrefix) {
-        elizaLogger.error("RECALL_COT_LOG_PREFIX is required");
-        throw new Error("RECALL_COT_LOG_PREFIX is required");
+        elizaLogger.error("RECALL_MEMORY_PREFIX is required");
+        throw new Error("RECALL_MEMORY_PREFIX is required");
       }
 
       // Use runtime from parameter if provided, fallback to constructor runtime
