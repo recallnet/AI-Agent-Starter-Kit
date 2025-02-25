@@ -216,37 +216,52 @@ export class RecallService extends Service {
       elizaLogger.info("Creating DuckDB schema");
       try {
         await new Promise<void>((resolve, reject) => {
-          this.db.run(
-            `CREATE TABLE knowledge (
-                id TEXT,
+          this.db.exec(
+            `
+            -- ✅ Load Vector Similarity Search (VSS) Extension
+            INSTALL vss;
+            LOAD vss;
+        
+            -- ✅ Create Knowledge Table with Fixed Embedding Size
+            CREATE TABLE IF NOT EXISTS knowledge (
+                id TEXT PRIMARY KEY,
                 userId TEXT,
                 agentId TEXT,
                 content TEXT,
-                embedding FLOAT[], 
+                embedding FLOAT[1536], -- ⚠️ Ensure your embeddings match this size
                 roomId TEXT,
                 createdAt TEXT,
                 knowledgeFileKey TEXT,
                 UNIQUE(id, knowledgeFileKey)
             );
-            
-            CREATE TABLE processed_files (
+        
+            -- ✅ Create HNSW Index for Fast Vector Similarity Search
+            CREATE INDEX IF NOT EXISTS knowledge_hnsw_index 
+            ON knowledge USING HNSW (embedding)
+            WITH (metric = 'cosine');
+        
+            -- ✅ Create Processed Files Table
+            CREATE TABLE IF NOT EXISTS processed_files (
                 fileKey TEXT PRIMARY KEY,
                 processedAt TEXT
-            );`,
+            );
+            `,
             (err) => {
               if (err) {
-                elizaLogger.error(`Error creating schema: ${err.message}`, {
+                elizaLogger.error(`⛔ Error creating schema: ${err.message}`, {
                   error: err,
                   stack: err.stack,
                 });
                 reject(err);
               } else {
-                elizaLogger.info("Schema created successfully");
+                elizaLogger.info("✅ Schema created successfully");
                 resolve();
               }
             }
           );
         });
+
+        elizaLogger.info("DuckDB schema creation completed");
       } catch (schemaError) {
         elizaLogger.error(`Failed to create schema: ${schemaError.message}`);
         throw schemaError;
@@ -1161,66 +1176,6 @@ export class RecallService extends Service {
   }
 
   /**
-   * Searches for knowledge in the DuckDB database using embedding similarity.
-   * @param queryEmbedding The embedding to search with.
-   * @param roomId The room ID to search in.
-   * @param limit The maximum number of results to return.
-   * @param threshold The minimum similarity threshold.
-   * @returns An array of knowledge search results.
-   */
-  async searchKnowledgeByEmbedding(
-    queryEmbedding: number[],
-    roomId: string,
-    limit = 5,
-    threshold = 0.7
-  ): Promise<KnowledgeSearchResult[]> {
-    try {
-      const queryEmbeddingArray = `ARRAY[${queryEmbedding.join(",")}]`;
-
-      // Perform similarity search with filtering and thresholding
-      const searchResults: AnyType[] = await new Promise((resolve, reject) => {
-        this.db.all(
-          `SELECT id, userId, agentId, content, roomId, createdAt,
-            1 - (embedding <-> ${queryEmbeddingArray}) AS similarity 
-         FROM knowledge 
-         WHERE roomId = ? AND similarity > ?
-         ORDER BY similarity DESC 
-         LIMIT ?;`,
-          roomId,
-          threshold,
-          limit,
-          (err, res) => {
-            if (err) reject(err);
-            else resolve(res || []);
-          }
-        );
-      });
-
-      if (!searchResults || searchResults.length === 0) {
-        elizaLogger.info(`No similar knowledge found for roomId ${roomId}`);
-        return [];
-      }
-
-      // Map results to the expected format
-      return searchResults.map((result) => ({
-        id: result.id,
-        userId: result.userId,
-        agentId: result.agentId,
-        content: result.content,
-        roomId: result.roomId,
-        createdAt: result.createdAt,
-        knowledgeFileKey: result.knowledgeFileKey,
-        similarityScore: parseFloat(result.similarity),
-      }));
-    } catch (error) {
-      elizaLogger.error(
-        `Error searching knowledge by embedding: ${error.message}`
-      );
-      return [];
-    }
-  }
-
-  /**
    * Query knowledge across multiple rooms with relevance to a given text.
    * @param queryText The text to search for relevant knowledge.
    * @param roomIds Optional array of room IDs to search in. If not provided, searches across all rooms.
@@ -1230,16 +1185,15 @@ export class RecallService extends Service {
    */
   async queryKnowledge(
     queryText: Memory,
-    roomIds?: string[],
     limit = 10,
     threshold = 0.7
   ): Promise<KnowledgeItem[]> {
     try {
-      // First check if roomIds exists and has items
-      if (!roomIds?.length) {
-        elizaLogger.info("No rooms available for knowledge query.");
-        return [];
-      }
+      elizaLogger.info("📡 queryKnowledge() called", {
+        queryTextContent: queryText.content,
+        limit,
+        threshold,
+      });
 
       // Generate embedding for the query text
       const queryEmbedding =
@@ -1247,69 +1201,77 @@ export class RecallService extends Service {
         (await (
           await this.runtime.messageManager.addEmbeddingToMemory(queryText)
         ).embedding);
+
       if (!queryEmbedding || queryEmbedding.length === 0) {
-        elizaLogger.error("Failed to generate embedding for query text.");
+        elizaLogger.error("❌ Failed to generate embedding for query text.");
         return [];
       }
 
       elizaLogger.info("🔍 Query Embedding Generated", {
         queryEmbeddingExists: !!queryEmbedding,
-        embeddingLength: queryEmbedding?.length,
-        first10Values: queryEmbedding?.slice(0, 10),
+        embeddingLength: queryEmbedding.length,
+        first10Values: queryEmbedding.slice(0, 10),
       });
 
-      const queryEmbeddingArray = `ARRAY[${[...queryEmbedding].join(",")}]`; // ✅ Inline embedding
+      // Convert embedding to DuckDB array format
+      const queryEmbeddingArray = `ARRAY[${[...queryEmbedding].join(",")}]::FLOAT[${queryEmbedding.length}]`;
 
+      // Construct optimized SQL query using array_cosine_distance
       const query = `
-      SELECT id, userId, agentId, content, roomId, createdAt,
-          1 - (embedding <-> ${queryEmbeddingArray}) AS similarity 
-      FROM knowledge 
-      WHERE similarity > ${threshold || 0.7}
-      ORDER BY similarity DESC 
-      LIMIT ${limit || 10};
-    `;
+        SELECT id, userId, agentId, content, roomId, createdAt, knowledgeFileKey,
+          1 - array_cosine_distance(embedding, ${queryEmbeddingArray}) AS similarity
+        FROM knowledge
+        ORDER BY similarity DESC
+        LIMIT ${limit};
+      `;
 
-      // Query across all specified rooms
+      elizaLogger.info("📝 Executing SQL Query:", { query });
+
+      // Execute SQL query in DuckDB
       const searchResults: AnyType[] = await new Promise((resolve, reject) => {
         this.db.all(query, (err, res) => {
           if (err) {
-            elizaLogger.error(
-              `⛔ Error executing DuckDB query: ${err.message}`,
-              { query }
-            );
+            elizaLogger.error("⛔ Error executing DuckDB query!", {
+              error: err.message,
+              stack: err.stack,
+            });
             reject(err);
           } else {
+            elizaLogger.info(
+              `✅ Query executed successfully. Found ${res.length} results.`
+            );
             resolve(res || []);
           }
         });
       });
 
+      // Check if any results were found
       if (!searchResults || searchResults.length === 0) {
-        elizaLogger.info("No similar knowledge found across specified rooms.");
-        return [];
-      } else {
-        elizaLogger.info(
-          `Found ${searchResults.length} similar knowledge items.`
+        elizaLogger.warn(
+          "⚠️ No similar knowledge found. Consider lowering the threshold."
         );
-        elizaLogger.info(`First item: ${searchResults[0].content}`);
+        return [];
       }
+
+      // Debug first search result
+      elizaLogger.info("🔍 First search result:", {
+        firstResult: searchResults[0],
+      });
 
       // Transform results into KnowledgeItem format
       return searchResults.map((result) => {
-        // Parse the content string back into a Content object
         let contentObj: AnyType;
+
         try {
           contentObj =
             typeof result.content === "string"
               ? JSON.parse(result.content)
               : result.content;
 
-          // Ensure it has at least a text property
           if (!contentObj.text && typeof contentObj === "string") {
             contentObj = { text: contentObj };
           }
         } catch (e) {
-          // If parsing fails, treat the content as plain text
           contentObj = { text: result.content };
         }
 
@@ -1320,7 +1282,7 @@ export class RecallService extends Service {
         };
       });
     } catch (error) {
-      elizaLogger.error(`Error querying knowledge: ${error.message}`);
+      elizaLogger.error("❌ Error in queryKnowledge:", { error });
       return [];
     }
   }
@@ -1619,12 +1581,8 @@ export class RecallService extends Service {
         return "";
       }
 
-      // If we have a specific room context, use it
-      const roomId = message.roomId;
-      const roomIds = roomId ? [roomId] : undefined;
-
       // Query for relevant knowledge
-      const relevantKnowledge = await this.queryKnowledge(message, roomIds);
+      const relevantKnowledge = await this.queryKnowledge(message);
 
       if (!relevantKnowledge || relevantKnowledge.length === 0) {
         elizaLogger.info("No relevant knowledge found for the message.");
