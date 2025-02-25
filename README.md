@@ -233,23 +233,13 @@ pnpm run dev
      GITHUB_CLIENT_SECRET=1234567890abcdef1234567890abcdef12345678
      ```
 
-- `ORBIS_CONTEXT_ID`, `ORBIS_TABLE_ID`, & `ORBIS_ENV`: OrbisDB table identifiers to enable gated memory storage functionality
+- `RECALL_PRIVATE_KEY`, `RECALL_BUCKET_ALIAS`, & `RECALL_MEMORY_PREFIX`: Recall identifiers for using Recall for gated memory storage and use during inference
 
-  1. Visit the [Orbis Studio](https://studio.useorbis.com/) and log in with your browser wallet. Once logged in, set up a new context under the `Contexts` tab. Assign that value to `ORBIS_CONTEXT_ID` in your .env file
-
-  2. On the right-hand side of the same page, you should see a variable called "Environment ID" - this is the DID representation of the address you used to sign into the hosted Orbis studio. Assign this value to `ORBIS_ENV` in your .env file
-
-  3. Generate an OrbisDB seed to self-authenticate onto the Ceramic network and save to `ORBIS_SEED`:
-    ```sh
-    pnpm gen-seed
-    ```
-
-  4. Finally, deploy your OrbisDB data model we will use to create and query via vector search. Copy the value prefixed with "k" into your `.env` file next to `ORBIS_TABLE_ID`:
-    ```sh
-    pnpm deploy-model
-    ```
-
-  5. You can use the default provided values for `ORBIS_GATEWAY_URL` AND `CERAMIC_NODE_URL` provided in your .env.example file as-is
+  1. Visit the [Recall Docs](https://docs.recall.network/tools/cli) to install the CLI and create a new account, or simply export a private key from an existing EVM wallet and assign to `RECALL_PRIVATE_KEY` formatted like `0x<private-key>`
+  2. Choose any bucket alias to use as the default bucket for storing your gated memory objects and assign to `RECALL_MEMORY_PREFIX`, or use the default `my-bucket` alias provided in the example env file
+  3. Assign any prefix to be used for the keys of your gated memory objects and assign to `RECALL_MEMORY_PREFIX`, or simply use the `memory` default prefix provided
+  4. Obtain some testnet tokens from the [Recall Faucet](https://docs.recall.network/intro/_faucet) - ensure that you purchase Recall credits once you receive testnet tokens. You can do so by invoking the `buyCreditAction` via Eliza, or with the [CLI]((https://docs.recall.network/tools/cli))
+  5. Ensure `USE_OPENAI_EMBEDDING` is set to `TRUE`
 
 **Note**: For production, update the Homepage URL and callback URL to your production domain.
 

@@ -5,6 +5,7 @@ import {
   ServiceType,
   stringToUuid,
   IAgentRuntime,
+  Content,
 } from "@ai16z/eliza";
 import duckdb from "duckdb";
 import { ParquetReader } from "@dsnp/parquetjs";
@@ -19,9 +20,8 @@ import {
 } from "@recallnet/sdk/client";
 import { CreditAccount } from "@recallnet/sdk/credit";
 import { Address, Hex, parseEther, TransactionReceipt } from "viem";
-import { AnyType } from "src/utils.js";
-import { Content } from "@ai16z/eliza";
 import { randomUUID } from "crypto";
+import { AnyType } from "src/utils.js";
 
 // Interface for Memory objects as used across the application
 interface Memory {
@@ -87,6 +87,32 @@ export type KnowledgeItem = {
   similarity?: number;
 };
 
+// Types for Parquet record format
+export type ParquetRecord = {
+  userId: string;
+  agentId: string;
+  userMessage: string;
+  log: string;
+  embedding: number[];
+  timestamp: string;
+};
+
+// Type for SQL query results
+export type SqlQueryResult = {
+  [key: string]: string | number | boolean | number[] | null;
+};
+
+// Specify detailed object bucket query response
+export type BucketQueryResponse = {
+  result?: {
+    objects: Array<{
+      key: string;
+      size: number;
+      lastModified: string;
+    }>;
+  };
+};
+
 // Load environment variables with detailed logging
 const privateKey = process.env.RECALL_PRIVATE_KEY as Hex;
 const envAlias = process.env.RECALL_BUCKET_ALIAS as string;
@@ -94,16 +120,18 @@ const envPrefix = process.env.RECALL_MEMORY_PREFIX as string;
 const network = process.env.RECALL_NETWORK as string;
 
 // Add debug logging for environment variables
-elizaLogger.info("Environment configuration:", {
+elizaLogger.info("[RecallService] Environment configuration:", {
   RECALL_PRIVATE_KEY: privateKey ? "[REDACTED]" : undefined,
   RECALL_BUCKET_ALIAS: envAlias,
   RECALL_MEMORY_PREFIX: envPrefix,
   RECALL_NETWORK: network,
 });
 
+type SqlParam = string | number | boolean | number[] | null;
+
 export class RecallService extends Service {
   static get serviceType(): ServiceType {
-    elizaLogger.info("Getting RecallService.serviceType");
+    elizaLogger.info("[RecallService] Getting RecallService.serviceType");
     return "recall" as ServiceType;
   }
 
@@ -116,24 +144,35 @@ export class RecallService extends Service {
   private processedFiles: Set<string> = new Set();
   private isInitialized: boolean = false;
 
+  // Define timeout constants for easier configuration
+  private static readonly DEFAULT_TIMEOUT = 30000; // 30 seconds
+  private static readonly BUCKET_OPERATION_TIMEOUT = 15000; // 15 seconds
+  private static readonly MAX_RETRY_ATTEMPTS = 3;
+  private static readonly RETRY_DELAY_MS = 1000;
+
   getInstance(): RecallService {
-    elizaLogger.info("RecallService.getInstance() called");
+    elizaLogger.info("[RecallService] RecallService.getInstance() called");
     return this;
   }
 
   constructor(_runtime: IAgentRuntime) {
     super();
-    elizaLogger.info("RecallService constructor called");
+    elizaLogger.info("[RecallService] RecallService constructor called");
     try {
-      elizaLogger.info("RecallService super() constructor completed");
+      elizaLogger.info(
+        "[RecallService] RecallService super() constructor completed"
+      );
       this.runtime = _runtime;
-      elizaLogger.info("RecallService constructor runtime assigned", {
-        runtimeExists: !!_runtime,
-        runtimeType: _runtime ? typeof _runtime : "undefined",
-      });
+      elizaLogger.info(
+        "[RecallService] RecallService constructor runtime assigned",
+        {
+          runtimeExists: !!_runtime,
+          runtimeType: _runtime ? typeof _runtime : "undefined",
+        }
+      );
     } catch (error) {
       elizaLogger.error(
-        `Error in RecallService constructor: ${error.message}`,
+        `[RecallService] Error in RecallService constructor: ${error.message}`,
         {
           error,
           stack: error.stack,
@@ -144,7 +183,7 @@ export class RecallService extends Service {
   }
 
   async initialize(runtime: IAgentRuntime): Promise<void> {
-    elizaLogger.info("RecallService.initialize() called", {
+    elizaLogger.info("[RecallService] RecallService.initialize() called", {
       hasRuntime: !!runtime,
       hasThisRuntime: !!this.runtime,
     });
@@ -152,147 +191,201 @@ export class RecallService extends Service {
     try {
       // Guard against multiple initializations
       if (this.isInitialized) {
-        elizaLogger.warn("RecallService already initialized, skipping");
+        elizaLogger.warn(
+          "[RecallService] RecallService already initialized, skipping"
+        );
         return;
       }
 
       // Validate environment variables
-      if (!privateKey) {
-        elizaLogger.error("RECALL_PRIVATE_KEY is required");
-        throw new Error("RECALL_PRIVATE_KEY is required");
-      }
-      if (!envAlias) {
-        elizaLogger.error("RECALL_BUCKET_ALIAS is required");
-        throw new Error("RECALL_BUCKET_ALIAS is required");
-      }
-      if (!envPrefix) {
-        elizaLogger.error("RECALL_MEMORY_PREFIX is required");
-        throw new Error("RECALL_MEMORY_PREFIX is required");
-      }
+      this.validateEnvironmentVariables();
 
       // Use runtime from parameter if provided, fallback to constructor runtime
       if (runtime) {
-        elizaLogger.info("Using runtime from initialize() parameter");
+        elizaLogger.info(
+          "[RecallService] Using runtime from initialize() parameter"
+        );
         this.runtime = runtime;
       } else if (!this.runtime) {
-        elizaLogger.error("No runtime available for initialization");
-        throw new Error("No runtime available for initialization");
+        elizaLogger.error(
+          "[RecallService] No runtime available for initialization"
+        );
+        throw new Error(
+          "[RecallService] No runtime available for initialization"
+        );
       }
 
-      elizaLogger.info("RecallService initialization started");
+      elizaLogger.info("[RecallService] RecallService initialization started");
 
       // Set up blockchain connection
-      elizaLogger.info(
-        `Setting up blockchain connection with network: ${network || "testnet"}`
-      );
-      const chain = network ? getChain(network as ChainName) : testnet;
-      elizaLogger.info("Creating wallet client from private key");
-      const wallet = walletClientFromPrivateKey(privateKey, chain);
-      elizaLogger.info("Creating RecallClient");
-      this.client = new RecallClient({ walletClient: wallet });
-
-      // Set configuration values
-      this.alias = envAlias;
-      this.prefix = envPrefix;
-      elizaLogger.info(
-        `RecallService configured with alias: ${this.alias}, prefix: ${this.prefix}`
-      );
+      await this.setupBlockchainConnection();
 
       // Initialize DuckDB
-      elizaLogger.info("Initializing DuckDB in-memory database");
-      try {
-        const db = new duckdb.Database(":memory:"); // In-memory DB for performance
-        this.db = db.connect();
-        elizaLogger.info("DuckDB connection established");
-      } catch (dbError) {
-        elizaLogger.error(`Failed to initialize DuckDB: ${dbError.message}`, {
-          error: dbError,
-          stack: dbError.stack,
-        });
-        throw dbError;
-      }
-
-      // Create database schema
-      elizaLogger.info("Creating DuckDB schema");
-      try {
-        await new Promise<void>((resolve, reject) => {
-          this.db.exec(
-            `
-            -- ✅ Load Vector Similarity Search (VSS) Extension
-            INSTALL vss;
-            LOAD vss;
-        
-            -- ✅ Create Knowledge Table with Fixed Embedding Size
-            CREATE TABLE IF NOT EXISTS knowledge (
-                id TEXT PRIMARY KEY,
-                userId TEXT,
-                agentId TEXT,
-                content TEXT,
-                embedding FLOAT[1536], -- ⚠️ Ensure your embeddings match this size
-                roomId TEXT,
-                createdAt TEXT,
-                knowledgeFileKey TEXT,
-                UNIQUE(id, knowledgeFileKey)
-            );
-        
-            -- ✅ Create HNSW Index for Fast Vector Similarity Search
-            CREATE INDEX IF NOT EXISTS knowledge_hnsw_index 
-            ON knowledge USING HNSW (embedding)
-            WITH (metric = 'cosine');
-        
-            -- ✅ Create Processed Files Table
-            CREATE TABLE IF NOT EXISTS processed_files (
-                fileKey TEXT PRIMARY KEY,
-                processedAt TEXT
-            );
-            `,
-            (err) => {
-              if (err) {
-                elizaLogger.error(`⛔ Error creating schema: ${err.message}`, {
-                  error: err,
-                  stack: err.stack,
-                });
-                reject(err);
-              } else {
-                elizaLogger.info("✅ Schema created successfully");
-                resolve();
-              }
-            }
-          );
-        });
-
-        elizaLogger.info("DuckDB schema creation completed");
-      } catch (schemaError) {
-        elizaLogger.error(`Failed to create schema: ${schemaError.message}`);
-        throw schemaError;
-      }
+      await this.initializeDatabase();
 
       // Load processed files into memory
-      elizaLogger.info("Loading processed files into memory");
+      elizaLogger.info("[RecallService] Loading processed files into memory");
       try {
         await this.loadProcessedFiles();
-        elizaLogger.info(`Loaded ${this.processedFiles.size} processed files`);
+        elizaLogger.info(
+          `[RecallService] Loaded ${this.processedFiles.size} processed files`
+        );
       } catch (loadError) {
         elizaLogger.error(
-          `Error loading processed files: ${loadError.message}`
+          `[RecallService] Error loading processed files: ${loadError.message}`
         );
         throw loadError;
       }
 
       // Initialize accessControlService
       await this.initializeAccessControlService();
-      elizaLogger.info("accessControlService initialized");
+      elizaLogger.info("[RecallService] AccessControlService initialized");
 
       this.isInitialized = true;
-      elizaLogger.success("RecallService initialized successfully");
+      elizaLogger.success(
+        "[RecallService] RecallService initialized successfully"
+      );
     } catch (error) {
-      elizaLogger.error(`Error initializing RecallService: ${error.message}`, {
-        error,
-        stack: error.stack,
-        runtimeExists: !!this.runtime,
-      });
+      elizaLogger.error(
+        `[RecallService] Error initializing RecallService: ${error.message}`,
+        {
+          error,
+          stack: error.stack,
+          runtimeExists: !!this.runtime,
+        }
+      );
       throw error;
     }
+  }
+
+  /**
+   * Validates required environment variables
+   * @throws Error if required environment variables are missing
+   */
+  private validateEnvironmentVariables(): void {
+    // Validate environment variables
+    if (!privateKey) {
+      elizaLogger.error("[RecallService]: RECALL_PRIVATE_KEY is required");
+      throw new Error("[RecallService]: RECALL_PRIVATE_KEY is required");
+    }
+    if (!envAlias) {
+      elizaLogger.error("[RecallService]: RECALL_BUCKET_ALIAS is required");
+      throw new Error("[RecallService]: RECALL_BUCKET_ALIAS is required");
+    }
+    if (!envPrefix) {
+      elizaLogger.error("[RecallService]: RECALL_MEMORY_PREFIX is required");
+      throw new Error("[RecallService]: RECALL_MEMORY_PREFIX is required");
+    }
+  }
+
+  /**
+   * Sets up blockchain connection and client
+   */
+  private async setupBlockchainConnection(): Promise<void> {
+    // Set up blockchain connection
+    elizaLogger.info(
+      `[RecallService] Setting up blockchain connection with network: ${network || "testnet"}`
+    );
+    const chain = network ? getChain(network as ChainName) : testnet;
+    elizaLogger.info("[RecallService] Creating wallet client from private key");
+    const wallet = walletClientFromPrivateKey(privateKey, chain);
+    elizaLogger.info("[RecallService] Creating RecallClient");
+    this.client = new RecallClient({ walletClient: wallet });
+
+    // Set configuration values
+    this.alias = envAlias;
+    this.prefix = envPrefix;
+    elizaLogger.info(
+      `[RecallService] RecallService configured with alias: ${this.alias}, prefix: ${this.prefix}`
+    );
+  }
+
+  /**
+   * Initializes DuckDB database and creates schema
+   */
+  private async initializeDatabase(): Promise<void> {
+    // Initialize DuckDB
+    elizaLogger.info("[RecallService] Initializing DuckDB in-memory database");
+    try {
+      const db = new duckdb.Database(":memory:"); // In-memory DB for performance
+      this.db = db.connect();
+      elizaLogger.info("[RecallService] DuckDB connection established");
+    } catch (dbError) {
+      elizaLogger.error(
+        `[RecallService] Failed to initialize DuckDB: ${dbError.message}`,
+        {
+          error: dbError,
+          stack: dbError.stack,
+        }
+      );
+      throw dbError;
+    }
+
+    // Create database schema
+    elizaLogger.info("[RecallService] Creating DuckDB schema");
+    try {
+      await this.createDatabaseSchema();
+      elizaLogger.info("[RecallService] DuckDB schema creation completed");
+    } catch (schemaError) {
+      elizaLogger.error(
+        `[RecallService] Failed to create schema: ${schemaError.message}`
+      );
+      throw schemaError;
+    }
+  }
+
+  /**
+   * Creates the database schema in DuckDB
+   */
+  private async createDatabaseSchema(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.db.exec(
+        `
+        -- ✅ Load Vector Similarity Search (VSS) Extension
+        INSTALL vss;
+        LOAD vss;
+    
+        -- ✅ Create Knowledge Table with Fixed Embedding Size
+        CREATE TABLE IF NOT EXISTS knowledge (
+            id TEXT PRIMARY KEY,
+            userId TEXT,
+            agentId TEXT,
+            content TEXT,
+            embedding FLOAT[1536], -- ⚠️ Ensure your embeddings match this size
+            roomId TEXT,
+            createdAt TEXT,
+            knowledgeFileKey TEXT,
+            UNIQUE(id, knowledgeFileKey)
+        );
+    
+        -- ✅ Create HNSW Index for Fast Vector Similarity Search
+        CREATE INDEX IF NOT EXISTS knowledge_hnsw_index 
+        ON knowledge USING HNSW (embedding)
+        WITH (metric = 'cosine');
+    
+        -- ✅ Create Processed Files Table
+        CREATE TABLE IF NOT EXISTS processed_files (
+            fileKey TEXT PRIMARY KEY,
+            processedAt TEXT
+        );
+        `,
+        (err) => {
+          if (err) {
+            elizaLogger.error(
+              `[RecallService]: ⛔ Error creating schema: ${err.message}`,
+              {
+                error: err,
+                stack: err.stack,
+              }
+            );
+            reject(err);
+          } else {
+            elizaLogger.info("[RecallService]: ✅ Schema created successfully");
+            resolve();
+          }
+        }
+      );
+    });
   }
 
   /**
@@ -302,25 +395,25 @@ export class RecallService extends Service {
   async initializeAccessControlService(): Promise<boolean> {
     try {
       elizaLogger.info(
-        "Initializing AccessControlService for encryption/decryption"
+        "[RecallService] Initializing AccessControlService for encryption/decryption"
       );
       this.accessControlService = AccessControlService.getInstance();
       await this.accessControlService.start();
 
       if (!this.accessControlService.isConfigured()) {
         elizaLogger.warn(
-          "AccessControlService is not properly configured. Content will not be encrypted."
+          "[RecallService] AccessControlService is not properly configured. Content will not be encrypted."
         );
         return false;
       } else {
         elizaLogger.info(
-          "AccessControlService initialized successfully. Content encryption is enabled."
+          "[RecallService] AccessControlService initialized successfully. Content encryption is enabled."
         );
         return true;
       }
     } catch (error) {
       elizaLogger.error(
-        `Error initializing AccessControlService: ${error.message}`
+        `[RecallService] Error initializing AccessControlService: ${error.message}`
       );
       return false;
     }
@@ -359,49 +452,91 @@ export class RecallService extends Service {
   }
 
   /**
-   * Loads processed files from DuckDB into memory.
-   * @returns A promise that resolves when the files are loaded.
+   * Executes a SQL query and returns the results
+   * @param query SQL query to execute
+   * @param params Parameters for the query
+   * @returns Promise resolving to query results
    */
-  private async loadProcessedFiles(): Promise<void> {
-    elizaLogger.info("Loading processed files from DuckDB");
+  private async executeSql<T extends Record<string, unknown>>(
+    query: string,
+    ...params: SqlParam[]
+  ): Promise<T[]> {
     return new Promise((resolve, reject) => {
-      // The SQL query doesn't need any parameters, so provide an empty array
       this.db.all(
-        "SELECT fileKey FROM processed_files;",
-        (err: Error | null, rows: AnyType) => {
+        query,
+        ...params,
+        (err: Error | null, rows: duckdb.TableData) => {
           if (err) {
             elizaLogger.error(
-              `Error querying processed files: ${err.message}`,
+              `[RecallService]: Error executing SQL: ${err.message}`,
               {
                 error: err,
-                stack: err.stack,
+                query,
+                params: JSON.stringify(params),
               }
             );
             reject(err);
             return;
           }
-          try {
-            this.processedFiles = new Set(
-              rows.map((row: { fileKey: string }) => row.fileKey)
-            );
-            elizaLogger.info(
-              `Loaded ${this.processedFiles.size} processed files from database`
-            );
-            resolve();
-          } catch (mapError) {
-            elizaLogger.error(
-              `Error processing query results: ${mapError.message}`,
-              {
-                error: mapError,
-                stack: mapError.stack,
-                rows: rows ? `${rows.length} rows` : "undefined",
-              }
-            );
-            reject(mapError);
-          }
+          resolve(rows as unknown as T[]);
         }
       );
     });
+  }
+
+  /**
+   * Executes a SQL statement that doesn't return results
+   * @param statement SQL statement to execute
+   * @param params Parameters for the statement
+   * @returns Promise resolving when the statement completes
+   */
+  private async executeSqlStatement(
+    statement: string,
+    ...params: SqlParam[]
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.db.run(statement, ...params, (err) => {
+        if (err) {
+          elizaLogger.error(
+            `[RecallService]: Error executing SQL statement: ${err.message}`,
+            {
+              error: err,
+              statement,
+              params: JSON.stringify(params),
+            }
+          );
+          reject(err);
+          return;
+        }
+        resolve();
+      });
+    });
+  }
+
+  /**
+   * Loads processed files from DuckDB into memory.
+   * @returns A promise that resolves when the files are loaded.
+   */
+  private async loadProcessedFiles(): Promise<void> {
+    elizaLogger.info("[RecallService]: Loading processed files from DuckDB");
+    try {
+      const rows = await this.executeSql<{ fileKey: string }>(
+        "SELECT fileKey FROM processed_files;"
+      );
+      this.processedFiles = new Set(rows.map((row) => row.fileKey));
+      elizaLogger.info(
+        `[RecallService]: Loaded ${this.processedFiles.size} processed files from database`
+      );
+    } catch (error) {
+      elizaLogger.error(
+        `[RecallService]: Error loading processed files: ${error.message}`,
+        {
+          error,
+          stack: error.stack,
+        }
+      );
+      throw error;
+    }
   }
 
   /**
@@ -414,20 +549,25 @@ export class RecallService extends Service {
       return; // Already processed
     }
 
-    await new Promise<void>((resolve, reject) => {
-      this.db.run(
+    try {
+      await this.executeSqlStatement(
         "INSERT INTO processed_files (fileKey, processedAt) VALUES (?, ?);",
         fileKey,
-        new Date().toISOString(),
-        (err) => {
-          if (err) reject(err);
-          else {
-            this.processedFiles.add(fileKey);
-            resolve();
-          }
+        new Date().toISOString()
+      );
+      this.processedFiles.add(fileKey);
+      elizaLogger.debug(`[RecallService] Marked file as processed: ${fileKey}`);
+    } catch (error) {
+      elizaLogger.error(
+        `[RecallService] Error marking file as processed: ${error.message}`,
+        {
+          error,
+          stack: error.stack,
+          fileKey,
         }
       );
-    });
+      throw error;
+    }
   }
 
   /**
@@ -439,7 +579,9 @@ export class RecallService extends Service {
       const info = await this.client.accountManager().info();
       return info.result;
     } catch (error) {
-      elizaLogger.error(`Error getting account info: ${error.message}`);
+      elizaLogger.error(
+        `[RecallService] Error getting account info: ${error.message}`
+      );
       throw error;
     }
   }
@@ -453,7 +595,9 @@ export class RecallService extends Service {
       const info = await this.client.bucketManager().list();
       return info.result;
     } catch (error) {
-      elizaLogger.error(`Error listing buckets: ${error.message}`);
+      elizaLogger.error(
+        `[RecallService] Error listing buckets: ${error.message}`
+      );
       throw error;
     }
   }
@@ -467,7 +611,9 @@ export class RecallService extends Service {
       const info = await this.client.creditManager().getAccount();
       return info.result;
     } catch (error) {
-      elizaLogger.error(`Error getting credit info: ${error.message}`);
+      elizaLogger.error(
+        `[RecallService] Error getting credit info: ${error.message}`
+      );
       throw error;
     }
   }
@@ -482,7 +628,9 @@ export class RecallService extends Service {
       const info = await this.client.creditManager().buy(parseEther(amount));
       return info;
     } catch (error) {
-      elizaLogger.error(`Error buying credit: ${error.message}`);
+      elizaLogger.error(
+        `[RecallService] Error buying credit: ${error.message}`
+      );
       throw error;
     }
   }
@@ -494,7 +642,9 @@ export class RecallService extends Service {
    */
   public async getOrCreateBucket(bucketAlias: string): Promise<Address> {
     try {
-      elizaLogger.info(`Looking for bucket with alias: ${bucketAlias}`);
+      elizaLogger.info(
+        `[RecallService] Looking for bucket with alias: ${bucketAlias}`
+      );
 
       // Try to find the bucket by alias
       const buckets = await this.client.bucketManager().list();
@@ -504,12 +654,12 @@ export class RecallService extends Service {
         );
         if (bucket) {
           elizaLogger.info(
-            `Found existing bucket "${bucketAlias}" at ${bucket.addr}`
+            `[RecallService] Found existing bucket "${bucketAlias}" at ${bucket.addr}`
           );
           return bucket.addr; // Return existing bucket address
         } else {
           elizaLogger.info(
-            `Bucket with alias "${bucketAlias}" not found, creating a new one.`
+            `[RecallService] Bucket with alias "${bucketAlias}" not found, creating a new one.`
           );
         }
       }
@@ -522,17 +672,21 @@ export class RecallService extends Service {
       const newBucket = query.result;
       if (!newBucket) {
         elizaLogger.error(
-          `Failed to create new bucket with alias: ${bucketAlias}`
+          `[RecallService] Failed to create new bucket with alias: ${bucketAlias}`
         );
-        throw new Error(`Failed to create bucket: ${bucketAlias}`);
+        throw new Error(
+          `[RecallService] Failed to create bucket: ${bucketAlias}`
+        );
       }
 
       elizaLogger.info(
-        `Successfully created new bucket "${bucketAlias}" at ${newBucket.bucket}`
+        `[RecallService] Successfully created new bucket "${bucketAlias}" at ${newBucket.bucket}`
       );
       return newBucket.bucket;
     } catch (error) {
-      elizaLogger.error(`Error in getOrCreateBucket: ${error.message}`);
+      elizaLogger.error(
+        `[RecallService] Error in getOrCreateBucket: ${error.message}`
+      );
       throw error;
     }
   }
@@ -557,7 +711,9 @@ export class RecallService extends Service {
       });
       return info;
     } catch (error) {
-      elizaLogger.error(`Error adding object: ${error.message}`);
+      elizaLogger.error(
+        `[RecallService] Error adding object: ${error.message}`
+      );
       throw error;
     }
   }
@@ -576,7 +732,9 @@ export class RecallService extends Service {
       const info = await this.client.bucketManager().get(bucket, key);
       return info.result;
     } catch (error) {
-      elizaLogger.warn(`Error getting object: ${error.message}`);
+      elizaLogger.warn(
+        `[RecallService] Error getting object: ${error.message}`
+      );
       throw error;
     }
   }
@@ -593,7 +751,7 @@ export class RecallService extends Service {
   ): boolean {
     if (!memory) {
       elizaLogger.debug(
-        `Validation failed at ${context}: memory is null or undefined`
+        `[RecallService] Validation failed at ${context}: memory is null or undefined`
       );
       return false;
     }
@@ -613,10 +771,10 @@ export class RecallService extends Service {
       // Handle string embeddings by parsing them
       if (typeof memory.embedding === "string") {
         try {
-          memory.embedding = JSON.parse(memory.embedding);
+          memory.embedding = JSON.parse(memory.embedding as unknown as string);
         } catch (e) {
           elizaLogger.error(
-            `Failed to parse embedding string at ${context}: ${e.message}`
+            `[RecallService] Failed to parse embedding string at ${context}: ${e.message}`
           );
           return false;
         }
@@ -646,7 +804,7 @@ export class RecallService extends Service {
       // Log validation results
       if (!isValid) {
         elizaLogger.debug(
-          `Embedding validation failed at ${context} for memory ${validation.memoryId}`,
+          `[RecallService] Embedding validation failed at ${context} for memory ${validation.memoryId}`,
           {
             validationResults: validation,
             failureReason: {
@@ -664,7 +822,7 @@ export class RecallService extends Service {
       return isValid;
     } catch (error) {
       elizaLogger.error(
-        `Error during embedding validation at ${context}: ${error.message}`
+        `[RecallService] Error during embedding validation at ${context}: ${error.message}`
       );
       return false;
     }
@@ -706,7 +864,7 @@ export class RecallService extends Service {
           if (this.validateEmbedding(preparedMemory, "after copy")) {
             preparedMemories.push(preparedMemory);
             elizaLogger.info(
-              `Using existing embedding for memory ${memory.id}`,
+              `[RecallService] Using existing embedding for memory ${memory.id}`,
               {
                 embeddingLength: preparedMemory.embedding.length,
               }
@@ -714,13 +872,15 @@ export class RecallService extends Service {
             continue;
           } else {
             elizaLogger.warn(
-              `Failed to copy embedding for memory ${memory.id}, will try to generate new one`
+              `[RecallService] Failed to copy embedding for memory ${memory.id}, will try to generate new one`
             );
           }
         }
 
         // Need to generate new embedding
-        elizaLogger.info(`Generating new embedding for memory ${memory.id}`);
+        elizaLogger.info(
+          `[RecallService] Generating new embedding for memory ${memory.id}`
+        );
 
         // Create a clean copy without any existing embedding
         const memoryForEmbedding = {
@@ -730,7 +890,7 @@ export class RecallService extends Service {
         };
 
         // Try to generate embedding with retries
-        let attemptsLeft = 3;
+        let attemptsLeft = RecallService.MAX_RETRY_ATTEMPTS;
         let embeddingSuccess = false;
         let generatedMemory: Memory = memoryForEmbedding;
 
@@ -750,17 +910,21 @@ export class RecallService extends Service {
             attemptsLeft--;
             if (attemptsLeft > 0) {
               elizaLogger.warn(
-                `Invalid embedding generated for memory ${memory.id}, ${attemptsLeft} attempts remaining`
+                `[RecallService] Invalid embedding generated for memory ${memory.id}, ${attemptsLeft} attempts remaining`
               );
-              await new Promise((resolve) => setTimeout(resolve, 1000));
+              await new Promise((resolve) =>
+                setTimeout(resolve, RecallService.RETRY_DELAY_MS)
+              );
             }
           } catch (embedError) {
             attemptsLeft--;
             if (attemptsLeft > 0) {
               elizaLogger.warn(
-                `Error generating embedding for memory ${memory.id}, ${attemptsLeft} attempts remaining: ${embedError.message}`
+                `[RecallService] Error generating embedding for memory ${memory.id}, ${attemptsLeft} attempts remaining: ${embedError.message}`
               );
-              await new Promise((resolve) => setTimeout(resolve, 1000));
+              await new Promise((resolve) =>
+                setTimeout(resolve, RecallService.RETRY_DELAY_MS)
+              );
             } else {
               throw embedError;
             }
@@ -774,33 +938,33 @@ export class RecallService extends Service {
         ) {
           preparedMemories.push(generatedMemory);
           elizaLogger.info(
-            `Successfully added new embedding to memory ${memory.id}`,
+            `[RecallService] Successfully added new embedding to memory ${memory.id}`,
             {
               embeddingLength: generatedMemory.embedding?.length,
             }
           );
         } else {
           throw new Error(
-            `Failed to generate valid embedding for memory ${memory.id} after all attempts`
+            `[RecallService] Failed to generate valid embedding for memory ${memory.id} after all attempts`
           );
         }
       } catch (error) {
         elizaLogger.error(
-          `Failed to prepare memory ${memory.id}: ${error.message}`,
+          `[RecallService] Failed to prepare memory ${memory.id}: ${error.message}`,
           {
             error,
             stack: error.stack,
             memoryContent:
               typeof memory.content === "string"
                 ? "string content"
-                : memory.content,
+                : JSON.stringify(memory.content),
           }
         );
       }
     }
 
     // Log overall results
-    elizaLogger.info(`Memory preparation complete`, {
+    elizaLogger.info(`[RecallService] Memory preparation complete`, {
       total: memories.length,
       prepared: preparedMemories.length,
       successRate: `${((preparedMemories.length / memories.length) * 100).toFixed(1)}%`,
@@ -813,7 +977,7 @@ export class RecallService extends Service {
 
     if (invalidMemories.length > 0) {
       const error = new Error(
-        `${invalidMemories.length} memories have invalid embeddings after preparation`
+        `[RecallService] ${invalidMemories.length} memories have invalid embeddings after preparation`
       );
       elizaLogger.error(error.message, {
         invalidMemoryIds: invalidMemories.map((m) => m.id),
@@ -822,6 +986,120 @@ export class RecallService extends Service {
     }
 
     return preparedMemories;
+  }
+
+  /**
+   * Transforms Memory objects to ParquetRecord format for storage
+   * @param memories Array of memory objects
+   * @returns Array of ParquetRecord objects
+   */
+  private async transformMemoriesToParquetRecords(
+    memories: Memory[]
+  ): Promise<ParquetRecord[]> {
+    return memories.map((memory) => {
+      // Log the memory structure before transformation
+      elizaLogger.debug(`[RecallService] Memory pre-transform:`, {
+        id: memory.id,
+        hasEmbedding: !!memory.embedding,
+        embeddingLength: memory.embedding?.length,
+      });
+
+      // Extract text from content object or handle string content
+      const text =
+        typeof memory.content === "string"
+          ? memory.content
+          : memory.content.text || "";
+
+      elizaLogger.debug(
+        `[RecallService] Creating record from memory ID=${memory.id}, roomId=${memory.roomId}`
+      );
+
+      if (!memory.embedding || !Array.isArray(memory.embedding)) {
+        throw new Error(
+          `[RecallService] Memory ${memory.id} has invalid embedding during transformation`
+        );
+      }
+
+      const record: ParquetRecord = {
+        userId: memory.userId || "",
+        agentId: memory.agentId || "",
+        userMessage: text, // Store content as userMessage
+        log: text, // Also store in log for redundancy
+        embedding: [...memory.embedding], // Make a copy of the embedding array
+        timestamp: memory.createdAt
+          ? new Date(memory.createdAt).toISOString()
+          : new Date().toISOString(),
+      };
+
+      // Log the record after transformation
+      elizaLogger.debug(`[RecallService] Knowledge record created:`, {
+        userId: record.userId,
+        hasEmbedding: Array.isArray(record.embedding),
+        embeddingLength: record.embedding?.length,
+        recordKeys: Object.keys(record),
+      });
+
+      return record;
+    });
+  }
+
+  /**
+   * Creates a Parquet buffer from memory objects
+   * @param memories Array of memory objects to convert to Parquet
+   * @returns Buffer containing Parquet data
+   */
+  private async createParquetBuffer(memories: Memory[]): Promise<Buffer> {
+    // First transform memories to the proper record format
+    const records = await this.transformMemoriesToParquetRecords(memories);
+
+    // Verify all records have valid embeddings before proceeding
+    const withoutEmbeddings = records.filter(
+      (record) =>
+        !record.embedding ||
+        !Array.isArray(record.embedding) ||
+        record.embedding.length === 0
+    );
+
+    if (withoutEmbeddings.length > 0) {
+      elizaLogger.error(
+        `[RecallService] ${withoutEmbeddings.length} records missing embeddings before Parquet creation`,
+        {
+          records: withoutEmbeddings.map((r) => ({
+            userId: r.userId,
+            hasEmbedding: !!r.embedding,
+            embeddingLength: r.embedding?.length,
+          })),
+        }
+      );
+      throw new Error("[RecallService] Some records are missing embeddings");
+    }
+
+    // More detailed logging around Parquet creation
+    elizaLogger.info(
+      `[RecallService] Attempting to create Parquet buffer for ${records.length} records with structure:`,
+      {
+        sampleKeys: Object.keys(records[0]),
+        hasSampleEmbedding: !!records[0].embedding,
+        sampleEmbeddingLength: records[0].embedding?.length,
+      }
+    );
+
+    // Create the Parquet buffer
+    const parquetBuffer = await writeParquetToBuffer(records);
+
+    if (!parquetBuffer) {
+      throw new Error("[RecallService] Failed to generate Parquet buffer");
+    }
+
+    if (parquetBuffer.length === 0) {
+      throw new Error("[RecallService] Generated Parquet buffer is empty");
+    }
+
+    elizaLogger.info(
+      `[RecallService] Successfully generated Parquet buffer of ${parquetBuffer.length} bytes`
+    );
+
+    return parquetBuffer;
   }
 
   /**
@@ -839,7 +1117,9 @@ export class RecallService extends Service {
       const nextKnowledgeKey = `${this.prefix}${timestamp}.parquet`;
 
       // Ensure all memories have embeddings
-      elizaLogger.info(`Preparing ${batch.length} memories for storage`);
+      elizaLogger.info(
+        `[RecallService] Preparing ${batch.length} memories for storage`
+      );
       const preparedMemories = await this.prepareMemoriesForStorage(batch);
 
       // Verify all prepared memories have embeddings
@@ -852,7 +1132,7 @@ export class RecallService extends Service {
 
       if (missingEmbeddings.length > 0) {
         elizaLogger.error(
-          `${missingEmbeddings.length} memories still missing embeddings after preparation`,
+          `[RecallService] ${missingEmbeddings.length} memories still missing embeddings after preparation`,
           {
             memoryIds: missingEmbeddings.map((m) => m.id),
           }
@@ -861,12 +1141,14 @@ export class RecallService extends Service {
       }
 
       if (preparedMemories.length === 0) {
-        elizaLogger.warn("No valid memories to store after preparation.");
+        elizaLogger.warn(
+          "[RecallService] No valid memories to store after preparation."
+        );
         return undefined;
       }
 
       elizaLogger.info(
-        `Transforming ${preparedMemories.length} memories to knowledge format`
+        `[RecallService] Transforming ${preparedMemories.length} memories to knowledge format`
       );
 
       // Encrypt memory content before storing
@@ -875,14 +1157,16 @@ export class RecallService extends Service {
           let finalMemory;
           if (!this.accessControlService) {
             elizaLogger.warn(
-              "AccessControlService is unavailable, storing data without encryption."
+              "[RecallService] AccessControlService is unavailable, storing data without encryption."
             );
             finalMemory = memory;
           } else {
             finalMemory =
               await this.accessControlService.prepareMemoryForStorage(memory);
             if (!finalMemory) {
-              elizaLogger.error(`Failed to encrypt memory ${memory.id}`);
+              elizaLogger.error(
+                `[RecallService] Failed to encrypt memory ${memory.id}`
+              );
               return memory;
             }
           }
@@ -890,107 +1174,25 @@ export class RecallService extends Service {
         })
       );
 
-      const memoryRecords = encryptedMemories.map((memory) => {
-        // Log the memory structure before transformation
-        elizaLogger.debug(`Memory pre-transform:`, {
-          id: memory.id,
-          hasEmbedding: !!memory.embedding,
-          embeddingLength: memory.embedding?.length,
-        });
-
-        // Extract text from content object or handle string content
-        const text =
-          typeof memory.content === "string"
-            ? memory.content
-            : memory.content.text || "";
-
-        elizaLogger.debug(
-          `Creating record from memory ID=${memory.id}, roomId=${memory.roomId}`
-        );
-
-        if (!memory.embedding || !Array.isArray(memory.embedding)) {
-          throw new Error(
-            `Memory ${memory.id} has invalid embedding during transformation`
-          );
-        }
-
-        const record = {
-          userId: memory.userId || "",
-          agentId: memory.agentId || "",
-          userMessage: text, // Store content as userMessage
-          log: text, // Also store in log for redundancy
-          embedding: [...memory.embedding], // Make a copy of the embedding array
-          timestamp: memory.createdAt
-            ? new Date(memory.createdAt).toISOString()
-            : new Date().toISOString(),
-        };
-
-        // Log the record after transformation
-        elizaLogger.debug(`Knowledge record created:`, {
-          userId: record.userId,
-          hasEmbedding: Array.isArray(record.embedding),
-          embeddingLength: record.embedding?.length,
-          recordKeys: Object.keys(record),
-        });
-
-        return record;
-      });
-
-      // Verify all records have valid embeddings before proceeding
-      const withoutEmbeddings = memoryRecords.filter(
-        (record) =>
-          !record.embedding ||
-          !Array.isArray(record.embedding) ||
-          record.embedding.length === 0
-      );
-
-      if (withoutEmbeddings.length > 0) {
-        elizaLogger.error(
-          `${withoutEmbeddings.length} records missing embeddings before Parquet creation`,
-          {
-            records: withoutEmbeddings.map((r) => ({
-              userId: r.userId,
-              hasEmbedding: !!r.embedding,
-              embeddingLength: r.embedding?.length,
-            })),
-          }
-        );
-        return undefined;
-      }
-
-      // More detailed logging around Parquet creation
-      elizaLogger.info(
-        `Attempting to create Parquet buffer for ${memoryRecords.length} records with structure:`,
-        {
-          sampleKeys: Object.keys(memoryRecords[0]),
-          hasSampleEmbedding: !!memoryRecords[0].embedding,
-          sampleEmbeddingLength: memoryRecords[0].embedding?.length,
-        }
-      );
-
       try {
-        // Create the Parquet schema to match the CoT format
-        const parquetBuffer = await writeParquetToBuffer(memoryRecords);
+        const parquetBuffer = await this.createParquetBuffer(encryptedMemories);
 
         if (!parquetBuffer) {
-          elizaLogger.error("writeParquetToBuffer returned undefined");
+          elizaLogger.error(
+            "[RecallService] writeParquetToBuffer returned undefined"
+          );
           return undefined;
         }
 
         if (parquetBuffer.length === 0) {
           elizaLogger.error(
-            "Generated Parquet file is empty. Skipping upload."
+            "[RecallService] Generated Parquet file is empty. Skipping upload."
           );
           return undefined;
         }
 
         elizaLogger.info(
-          `Successfully generated Parquet buffer of ${parquetBuffer.length} bytes`
-        );
-
-        // Upload to Recall
-        elizaLogger.info(
-          `Uploading Parquet data to bucket ${bucketAddress} with key ${nextKnowledgeKey}`
+          `[RecallService] Uploading Parquet data to bucket ${bucketAddress} with key ${nextKnowledgeKey}`
         );
         const addObject = await this.withTimeout(
           this.client.bucketManager().add(
@@ -998,13 +1200,13 @@ export class RecallService extends Service {
             nextKnowledgeKey,
             Uint8Array.from(parquetBuffer) // Convert Buffer to Uint8Array
           ),
-          30000,
+          RecallService.DEFAULT_TIMEOUT,
           "Recall batch storage"
         );
 
         if (!addObject?.meta?.tx) {
           elizaLogger.error(
-            "❌ Recall API returned invalid response for batch storage",
+            "[RecallService] ❌ Recall API returned invalid response for batch storage",
             {
               response: JSON.stringify(addObject),
               bucket: bucketAddress,
@@ -1016,12 +1218,12 @@ export class RecallService extends Service {
         }
 
         elizaLogger.info(
-          `Successfully stored batch of ${memoryRecords.length} records at key: ${nextKnowledgeKey}`
+          `[RecallService] Successfully stored batch of ${encryptedMemories.length} records at key: ${nextKnowledgeKey}`
         );
         return nextKnowledgeKey;
       } catch (parquetError) {
         elizaLogger.error(
-          `Parquet generation/upload error: ${parquetError.message}`,
+          `[RecallService] Parquet generation/upload error: ${parquetError.message}`,
           {
             error: parquetError,
             stack: parquetError.stack,
@@ -1031,7 +1233,7 @@ export class RecallService extends Service {
       }
     } catch (error) {
       elizaLogger.error(
-        `Error storing knowledge as Parquet in Recall: ${error.message}`,
+        `[RecallService] Error storing knowledge as Parquet in Recall: ${error.message}`,
         {
           error,
           stack: error.stack,
@@ -1041,15 +1243,22 @@ export class RecallService extends Service {
     }
   }
 
+  /**
+   * Write a single memory to Recall as knowledge
+   * @param message Memory object to store
+   * @returns Key of the stored knowledge or undefined if operation failed
+   */
   async writeKnowledgeToRecall(message: Memory): Promise<string | undefined> {
     try {
       const bucketAddress = await this.withTimeout(
         this.getOrCreateBucket(this.alias),
-        15000,
+        RecallService.BUCKET_OPERATION_TIMEOUT,
         "Get/Create bucket"
       );
 
-      elizaLogger.info(`📂 Processing message ID=${message.id}`);
+      elizaLogger.info(
+        `[RecallService] 📂 Processing message ID=${message.id}`
+      );
 
       const knowledgeFileKey = await this.storeBatchToRecall(
         bucketAddress,
@@ -1058,23 +1267,25 @@ export class RecallService extends Service {
 
       if (knowledgeFileKey) {
         await this.insertKnowledgeIntoDuckDB(message, knowledgeFileKey);
-        elizaLogger.success(`✅ Successfully synced message ID=${message.id}`);
+        elizaLogger.success(
+          `[RecallService] ✅ Successfully synced message ID=${message.id}`
+        );
         return knowledgeFileKey;
       } else {
         elizaLogger.warn(
-          `⚠️ Failed to sync message ID=${message.id} - will retry on next sync`
+          `[RecallService] ⚠️ Failed to sync message ID=${message.id} - will retry on next sync`
         );
         return undefined;
       }
     } catch (error) {
       if (error.message.includes("timed out")) {
         elizaLogger.error(
-          `⏳ Recall sync operation timed out: ${error.message}`
+          `[RecallService] ⏳ Recall sync operation timed out: ${error.message}`
         );
         return undefined;
       } else {
         elizaLogger.error(
-          `❌ Error in writeKnowledgeToRecall: ${error.message}`
+          `[RecallService] ❌ Error in writeKnowledgeToRecall: ${error.message}`
         );
         return undefined;
       }
@@ -1097,14 +1308,14 @@ export class RecallService extends Service {
       memory.embedding.length === 0
     ) {
       elizaLogger.warn(
-        `Memory ${memory.id} has no embedding, skipping insertion into DuckDB`
+        `[RecallService] Memory ${memory.id} has no embedding, skipping insertion into DuckDB`
       );
       return;
     }
 
     // Debug the values we're about to insert
     elizaLogger.debug(
-      `Preparing to insert memory into DuckDB: ID=${memory.id}, file=${knowledgeFileKey}`
+      `[RecallService] Preparing to insert memory into DuckDB: ID=${memory.id}, file=${knowledgeFileKey}`
     );
 
     const embeddingArray = memory.embedding.map((num) =>
@@ -1120,56 +1331,33 @@ export class RecallService extends Service {
     const memoryId = memory.id || stringToUuid(randomUUID());
 
     try {
-      await new Promise<void>((resolve, reject) => {
-        // Debug all parameters to ensure we have the correct count
-        const params = [
-          memoryId,
-          memory.userId,
-          memory.agentId,
-          contentStr,
-          JSON.stringify(embeddingArray),
-          memory.roomId,
-          createdAtStr,
-          knowledgeFileKey,
-        ];
+      // Use the reusable SQL execution method
+      await this.executeSqlStatement(
+        `INSERT INTO knowledge 
+         VALUES (?, ?, ?, ?, CAST(? AS FLOAT[]), ?, ?, ?)
+         ON CONFLICT (id, knowledgeFileKey) DO NOTHING;`,
+        memoryId,
+        memory.userId,
+        memory.agentId,
+        contentStr,
+        JSON.stringify(embeddingArray),
+        memory.roomId,
+        createdAtStr,
+        knowledgeFileKey
+      );
 
-        elizaLogger.debug(
-          `SQL insert parameters: ${params.length} parameters`,
-          {
-            paramCount: params.length,
-          }
-        );
-
-        this.db.run(
-          `INSERT INTO knowledge 
-       VALUES (?, ?, ?, ?, CAST(? AS FLOAT[]), ?, ?, ?)
-       ON CONFLICT (id, knowledgeFileKey) DO NOTHING;`,
-          ...params,
-          (err) => {
-            if (err) {
-              elizaLogger.error(`Error in SQL insert: ${err.message}`, {
-                error: err,
-                params: params.map(
-                  (p, i) =>
-                    `param${i}: ${typeof p} ${p === null ? "null" : typeof p === "string" ? p.substring(0, 50) + "..." : p}`
-                ),
-              });
-              reject(err);
-            } else {
-              elizaLogger.debug(
-                `Successfully inserted memory ${memoryId} into DuckDB`
-              );
-              resolve();
-            }
-          }
-        );
-      });
+      elizaLogger.debug(
+        `[RecallService] Successfully inserted memory ${memoryId} into DuckDB`
+      );
     } catch (error) {
       if (!error.message.includes("UNIQUE constraint")) {
-        elizaLogger.error(`Error inserting knowledge: ${error.message}`, {
-          error,
-          stack: error.stack,
-        });
+        elizaLogger.error(
+          `[RecallService] Error inserting knowledge: ${error.message}`,
+          {
+            error,
+            stack: error.stack,
+          }
+        );
         throw error;
       }
     }
@@ -1182,13 +1370,14 @@ export class RecallService extends Service {
    * @param threshold The minimum similarity threshold.
    * @returns An array of knowledge items formatted for use in the runtime.
    */
+  // Original code for queryKnowledge
   async queryKnowledge(
     queryText: Memory,
     limit = 10,
     threshold = 0.7
   ): Promise<KnowledgeItem[]> {
     try {
-      elizaLogger.info("📡 queryKnowledge() called", {
+      elizaLogger.info("[RecallService] 📡 queryKnowledge() called", {
         queryTextContent: queryText.content,
         limit,
         threshold,
@@ -1202,11 +1391,13 @@ export class RecallService extends Service {
         ).embedding);
 
       if (!queryEmbedding || queryEmbedding.length === 0) {
-        elizaLogger.error("❌ Failed to generate embedding for query text.");
+        elizaLogger.error(
+          "[RecallService] ❌ Failed to generate embedding for query text."
+        );
         return [];
       }
 
-      elizaLogger.info("🔍 Query Embedding Generated", {
+      elizaLogger.info("[RecallService] 🔍 Query Embedding Generated", {
         queryEmbeddingExists: !!queryEmbedding,
         embeddingLength: queryEmbedding.length,
         first10Values: queryEmbedding.slice(0, 10),
@@ -1217,66 +1408,86 @@ export class RecallService extends Service {
 
       // Construct optimized SQL query using array_cosine_distance
       const query = `
-        SELECT id, userId, agentId, content, roomId, createdAt, knowledgeFileKey,
-          1 - array_cosine_distance(embedding, ${queryEmbeddingArray}) AS similarity
-        FROM knowledge
-        ORDER BY similarity DESC
-        LIMIT ${limit};
-      `;
+      SELECT id, userId, agentId, content, roomId, createdAt, knowledgeFileKey,
+        1 - array_cosine_distance(embedding, ${queryEmbeddingArray}) AS similarity
+      FROM knowledge
+      WHERE 1 - array_cosine_distance(embedding, ${queryEmbeddingArray}) > ${threshold}
+      ORDER BY similarity DESC
+      LIMIT ${limit};
+    `;
 
-      elizaLogger.info("📝 Executing SQL Query:", { query });
+      elizaLogger.info(
+        "[RecallService] 📝 [RecallService] Executing SQL Query"
+      );
 
       // Execute SQL query in DuckDB
-      const searchResults: AnyType[] = await new Promise((resolve, reject) => {
-        this.db.all(query, (err, res) => {
-          if (err) {
-            elizaLogger.error("⛔ Error executing DuckDB query!", {
-              error: err.message,
-              stack: err.stack,
-            });
-            reject(err);
-          } else {
-            elizaLogger.info(
-              `✅ Query executed successfully. Found ${res.length} results.`
-            );
-            resolve(res || []);
-          }
-        });
-      });
+      const searchResults = await this.executeSql<SqlQueryResult>(query);
+
+      elizaLogger.info(
+        `[RecallService]: ${searchResults.length} similar results found`
+      );
 
       // Check if any results were found
       if (!searchResults || searchResults.length === 0) {
-        elizaLogger.warn("⚠️ No similar knowledge found.");
+        elizaLogger.warn("[RecallService] ⚠️ No similar knowledge found.");
         return [];
       }
 
       // Transform results into KnowledgeItem format
-      return searchResults.map((result) => {
-        let contentObj: AnyType;
-
-        try {
-          contentObj =
-            typeof result.content === "string"
-              ? JSON.parse(result.content)
-              : result.content;
-
-          if (!contentObj.text && typeof contentObj === "string") {
-            contentObj = { text: contentObj };
-          }
-        } catch (e) {
-          contentObj = { text: result.content };
-        }
-
-        return {
-          id: result.id,
-          content: contentObj,
-          similarity: parseFloat(result.similarity),
-        };
-      });
+      return this.transformSearchResultsToKnowledgeItems(searchResults);
     } catch (error) {
-      elizaLogger.error("❌ Error in queryKnowledge:", { error });
+      elizaLogger.error("[RecallService] ❌ Error in queryKnowledge:", {
+        error: error.message,
+        stack: error.stack,
+      });
       return [];
     }
+  }
+
+  /**
+   * Transform search results from DuckDB to KnowledgeItem format
+   * @param searchResults Array of search results from DuckDB
+   * @returns Array of KnowledgeItem objects
+   */
+  private transformSearchResultsToKnowledgeItems(
+    searchResults: SqlQueryResult[]
+  ): KnowledgeItem[] {
+    return searchResults.map((result) => {
+      let contentObj: Content;
+
+      try {
+        if (typeof result.content === "string") {
+          try {
+            // Try to parse content as JSON
+            contentObj = JSON.parse(result.content as string);
+
+            // If parsed but doesn't have text property, convert to proper format
+            if (!contentObj.text && typeof contentObj === "string") {
+              contentObj = { text: contentObj as unknown as string };
+            }
+          } catch (e) {
+            // If can't parse as JSON, treat as plain text
+            contentObj = {
+              text: String(result.content ?? "No content available"),
+            };
+          }
+        } else {
+          // Handle non-string content
+          contentObj = {
+            text: String(result.content ?? "No content available"),
+          };
+        }
+      } catch (e) {
+        // Fallback for any parsing issues
+        contentObj = { text: String(result.content ?? "No content available") };
+      }
+
+      return {
+        id: result.id as string,
+        content: contentObj,
+        similarity: parseFloat(result.similarity as string),
+      };
+    });
   }
 
   /**
@@ -1332,16 +1543,27 @@ export class RecallService extends Service {
     try {
       const bucketAddress = await this.getOrCreateBucket(bucketAlias);
       elizaLogger.info(
-        `Retrieving knowledge files from bucket: ${bucketAddress}`
+        `[RecallService] Retrieving knowledge files from bucket: ${bucketAddress}`
       );
 
       // Query for Parquet files
-      const queryResult = await this.client
+      const result = await this.client
         .bucketManager()
         .query(bucketAddress, { prefix: this.prefix });
+      const queryResult: BucketQueryResponse = {
+        result: {
+          objects: result.result.objects.map((obj) => ({
+            key: obj.key,
+            size: Number(obj.state.size),
+            lastModified: new Date().toISOString(), // or get from metadata if available
+          })),
+        },
+      };
 
       if (!queryResult.result?.objects.length) {
-        elizaLogger.info(`No knowledge files found in bucket: ${bucketAlias}`);
+        elizaLogger.info(
+          `[RecallService] No knowledge files found in bucket: ${bucketAlias}`
+        );
         return;
       }
 
@@ -1352,7 +1574,7 @@ export class RecallService extends Service {
         .filter((key) => !this.processedFiles.has(key));
 
       elizaLogger.info(
-        `Found ${unprocessedFiles.length} unprocessed files out of ${
+        `[RecallService] Found ${unprocessedFiles.length} unprocessed files out of ${
           queryResult.result.objects.length
         } total files`
       );
@@ -1364,76 +1586,63 @@ export class RecallService extends Service {
         } catch (fileError) {
           // Continue with next file even if one fails
           elizaLogger.error(
-            `Failed to process file ${knowledgeFile}, continuing with next file`
+            `[RecallService] Failed to process file ${knowledgeFile}, continuing with next file`
           );
         }
       }
     } catch (error) {
-      elizaLogger.error(`Error retrieving knowledge files: ${error.message}`, {
-        error,
-        stack: error.stack,
-      });
+      elizaLogger.error(
+        `[RecallService] Error retrieving knowledge files: ${error.message}`,
+        {
+          error,
+          stack: error.stack,
+        }
+      );
     }
   }
 
   /**
-   * Retrieves and processes a specific knowledge file from Recall.
-   * @param bucketAddress The bucket address containing the file.
-   * @param knowledgeFile The filename/key to process.
-   * @returns A promise that resolves when the file is processed.
+   * Convert various data formats to Buffer
+   * @param data Data in various formats
+   * @returns Buffer representation of the data
    */
-  private async processKnowledgeFile(
-    bucketAddress: Address,
+  private convertToBuffer(
+    data: Buffer | Uint8Array | number[] | string
+  ): Buffer {
+    if (Buffer.isBuffer(data)) {
+      return data;
+    } else if (Array.isArray(data) || data instanceof Uint8Array) {
+      return Buffer.from(data);
+    } else if (typeof data === "object") {
+      return Buffer.from(Object.values(data) as number[]);
+    } else {
+      throw new Error("Invalid data format for conversion to Buffer");
+    }
+  }
+
+  /**
+   * Process a Parquet buffer and store its contents in DuckDB
+   * @param parquetBuffer Buffer containing Parquet data
+   * @param knowledgeFile Filename/key associated with this buffer
+   */
+  private async processParquetBuffer(
+    parquetBuffer: Buffer,
     knowledgeFile: string
   ): Promise<void> {
+    const reader = await ParquetReader.openBuffer(parquetBuffer);
+    const cursor = reader.getCursor();
+    let recordCount = 0;
+    let decryptedCount = 0;
+    let record: Record<string, AnyType>;
+
     try {
-      elizaLogger.info(`📂 Processing knowledge file: ${knowledgeFile}`);
-
-      // Retrieve the Parquet file from Recall
-      const fileData = await this.client
-        .bucketManager()
-        .get(bucketAddress, knowledgeFile);
-      if (!fileData.result) {
-        elizaLogger.warn(
-          `⚠️ No data found in knowledge file: ${knowledgeFile}`
-        );
-        return;
-      }
-
-      // Convert file data to Buffer
-      let parquetBuffer: Buffer;
-      if (Buffer.isBuffer(fileData.result)) {
-        parquetBuffer = fileData.result;
-      } else if (
-        Array.isArray(fileData.result) ||
-        fileData.result instanceof Uint8Array
-      ) {
-        parquetBuffer = Buffer.from(fileData.result);
-      } else if (typeof fileData.result === "object") {
-        parquetBuffer = Buffer.from(Object.values(fileData.result) as number[]);
-      } else {
-        throw new Error(
-          `Invalid fileData.result format for knowledge file: ${knowledgeFile}`
-        );
-      }
-
-      elizaLogger.info(
-        `✅ Retrieved Parquet buffer (${parquetBuffer.length} bytes) for processing.`
-      );
-
-      const reader = await ParquetReader.openBuffer(parquetBuffer);
-      const cursor = reader.getCursor();
-      let recordCount = 0;
-      let decryptedCount = 0;
-      let record: AnyType;
-
-      while ((record = await cursor.next())) {
+      while ((record = (await cursor.next()) as Record<string, AnyType>)) {
         recordCount++;
 
         // Debug first record structure
         if (recordCount === 1) {
           elizaLogger.debug(
-            `🔍 First record structure: ${Object.keys(record).join(", ")}`
+            `[RecallService] 🔍 First record structure: ${Object.keys(record).join(", ")}`
           );
         }
 
@@ -1444,7 +1653,7 @@ export class RecallService extends Service {
         // Skip records missing critical fields
         if (!userId || !agentId || !embedding || !Array.isArray(embedding)) {
           elizaLogger.warn(
-            `⚠️ Skipping record missing critical fields in ${knowledgeFile}`,
+            `[RecallService] ⚠️ Skipping record missing critical fields in ${knowledgeFile}`,
             {
               recordKeys: Object.keys(record),
               hasUserId: !!userId,
@@ -1459,9 +1668,8 @@ export class RecallService extends Service {
           // Extract and decrypt content
           const originalText =
             record.userMessage || record.log || "No content available";
-          if (!this.accessControlService) {
-            return originalText;
-          }
+
+          // Decrypt content if needed and access control service is available
           const decryptedText = await this.decryptContentIfNeeded(
             originalText,
             this.accessControlService
@@ -1499,7 +1707,7 @@ export class RecallService extends Service {
           await this.insertKnowledgeIntoDuckDB(memoryRecord, knowledgeFile);
         } catch (recordError) {
           elizaLogger.error(
-            `❌ Error processing record in ${knowledgeFile}: ${recordError.message}`,
+            `[RecallService] ❌ Error processing record in ${knowledgeFile}: ${recordError.message}`,
             {
               error: recordError,
               stack: recordError.stack,
@@ -1511,12 +1719,59 @@ export class RecallService extends Service {
 
       await reader.close();
       elizaLogger.info(
-        `✅ Successfully processed ${recordCount} records from ${knowledgeFile}. 🔓 Decrypted ${decryptedCount} records.`
+        `[RecallService] ✅ Successfully processed ${recordCount} records from ${knowledgeFile}. 🔓 Decrypted ${decryptedCount} records.`
       );
+    } catch (error) {
+      elizaLogger.error(
+        `[RecallService] Error processing parquet buffer: ${error.message}`,
+        {
+          error,
+          stack: error.stack,
+        }
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * Retrieves and processes a specific knowledge file from Recall.
+   * @param bucketAddress The bucket address containing the file.
+   * @param knowledgeFile The filename/key to process.
+   * @returns A promise that resolves when the file is processed.
+   */
+  private async processKnowledgeFile(
+    bucketAddress: Address,
+    knowledgeFile: string
+  ): Promise<void> {
+    try {
+      elizaLogger.info(
+        `[RecallService] 📂 Processing knowledge file: ${knowledgeFile}`
+      );
+
+      // Retrieve the Parquet file from Recall
+      const fileData = await this.client
+        .bucketManager()
+        .get(bucketAddress, knowledgeFile);
+      if (!fileData.result) {
+        elizaLogger.warn(
+          `[RecallService] ⚠️ No data found in knowledge file: ${knowledgeFile}`
+        );
+        return;
+      }
+
+      // Convert file data to Buffer
+      const parquetBuffer = this.convertToBuffer(fileData.result);
+
+      elizaLogger.info(
+        `[RecallService] ✅ Retrieved Parquet buffer (${parquetBuffer.length} bytes) for processing.`
+      );
+
+      await this.processParquetBuffer(parquetBuffer, knowledgeFile);
+
       await this.markFileAsProcessed(knowledgeFile);
     } catch (error) {
       elizaLogger.error(
-        `❌ Error processing file ${knowledgeFile}: ${error.message}`,
+        `[RecallService] ❌ Error processing file ${knowledgeFile}: ${error.message}`,
         {
           error,
           stack: error.stack,
@@ -1534,21 +1789,25 @@ export class RecallService extends Service {
    */
   private async decryptContentIfNeeded(
     contentText: string,
-    accessControlService: AccessControlService
+    accessControlService: AccessControlService | undefined
   ): Promise<string> {
     try {
-      if (!contentText) return contentText;
+      if (!contentText || !accessControlService) return contentText;
 
       // Attempt to parse JSON (to check if it's encrypted)
       const contentJson = JSON.parse(contentText);
       if (contentJson.ciphertext && contentJson.dataToEncryptHash) {
-        elizaLogger.debug(`🔓 Attempting to decrypt message...`);
+        elizaLogger.debug(
+          `[RecallService] 🔓 Attempting to decrypt message...`
+        );
         const decryptedText = await accessControlService.decryptMessage(
           contentJson.ciphertext,
           contentJson.dataToEncryptHash
         );
         if (decryptedText) {
-          elizaLogger.info(`✅ Successfully decrypted message.`);
+          elizaLogger.info(
+            `[RecallService] ✅ Successfully decrypted message.`
+          );
           return decryptedText;
         }
       }
@@ -1577,7 +1836,9 @@ export class RecallService extends Service {
       const relevantKnowledge = await this.queryKnowledge(message);
 
       if (!relevantKnowledge || relevantKnowledge.length === 0) {
-        elizaLogger.info("No relevant knowledge found for the message.");
+        elizaLogger.info(
+          "[RecallService] No relevant knowledge found for the message."
+        );
         return "";
       }
 
@@ -1587,7 +1848,9 @@ export class RecallService extends Service {
 
       return formattedKnowledge;
     } catch (error) {
-      elizaLogger.error(`Error providing knowledge: ${error.message}`);
+      elizaLogger.error(
+        `[RecallService] Error providing knowledge: ${error.message}`
+      );
       return "";
     }
   }

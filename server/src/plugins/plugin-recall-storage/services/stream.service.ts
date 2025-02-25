@@ -15,11 +15,7 @@ class MemoryStream extends Writable {
     super();
   }
 
-  _write(
-    chunk: Buffer,
-    _encoding: BufferEncoding,
-    callback: (error?: Error | null) => void
-  ) {
+  _write(chunk: Buffer, _encoding: BufferEncoding, callback: () => void) {
     this.chunks.push(chunk);
     this.bytesWritten += chunk.length;
     callback();
@@ -33,7 +29,7 @@ class MemoryStream extends Writable {
     const encoding: BufferEncoding =
       typeof encodingOrCallback === "string" ? encodingOrCallback : "utf8";
 
-    const cb: (error?: Error | null) => void =
+    const cb: () => void =
       typeof encodingOrCallback === "function"
         ? encodingOrCallback
         : callback || (() => {});
