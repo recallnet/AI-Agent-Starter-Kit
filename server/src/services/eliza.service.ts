@@ -16,7 +16,6 @@ import Database from "better-sqlite3";
 import path from "path";
 import { readFileSync, existsSync } from "fs";
 import { resolve } from "path";
-import { gateDataPlugin } from "../plugins/gated-storage-plugin/index.js";
 import { recallStoragePlugin } from "../plugins/plugin-recall-storage/index.js";
 
 const __dirname = path.dirname(new URL(import.meta.url).pathname);
@@ -43,7 +42,6 @@ import { Message } from "grammy/types";
 import { Bot, Context } from "grammy";
 import { bootstrapPlugin } from "@ai16z/plugin-bootstrap";
 import { collablandPlugin } from "../plugins/collabland.plugin.js";
-import { StorageService } from "../plugins/gated-storage-plugin/services/storage.service.js";
 import { RecallService } from "../plugins/plugin-recall-storage/services/recall.service.js";
 
 const MAX_MESSAGE_LENGTH = 4096; // Telegram's max message length
@@ -595,12 +593,7 @@ export class ElizaService extends BaseService {
         modelProvider: character.modelProvider || ModelProviderName.OPENAI,
         character,
         conversationLength: 4096,
-        plugins: [
-          bootstrapPlugin,
-          collablandPlugin,
-          gateDataPlugin,
-          recallStoragePlugin,
-        ],
+        plugins: [bootstrapPlugin, collablandPlugin, recallStoragePlugin],
         cacheManager: new CacheManager(new MemoryCacheAdapter()),
         logging: true,
       });
@@ -630,8 +623,6 @@ export class ElizaService extends BaseService {
     try {
       // make sure this gets initialized before anything tries to use it in the plugin.
       // not sure where this should actually be hooked up
-      await StorageService.getInstance().start();
-
       const service = new RecallService(this.runtime);
       await service.initialize(this.runtime);
       this.runtime.registerService(service);

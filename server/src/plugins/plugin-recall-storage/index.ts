@@ -8,6 +8,8 @@ import { listBucketsAction } from "./actions/list-buckets.js";
 import { createBucketAction } from "./actions/create-bucket.js";
 import { addObjectAction } from "./actions/add-object.js";
 import { getObjectAction } from "./actions/get-object.js";
+import { gateDataAction } from "./actions/gate-action.js";
+import { knowledgeEvaluator } from "./evaluators/knowledge.js";
 
 export const recallStoragePlugin: Plugin = {
   name: "Recall Storage Plugin",
@@ -17,12 +19,14 @@ export const recallStoragePlugin: Plugin = {
     getCreditBalanceAction,
     getAccountInfoAction,
     listBucketsAction,
+    gateDataAction,
     addObjectAction,
     getObjectAction,
     createBucketAction,
   ],
   providers: [recallCotProvider],
   services: [],
+  evaluators: [knowledgeEvaluator],
 };
 
 export default recallStoragePlugin;

@@ -7,12 +7,12 @@ import {
   IAgentRuntime,
 } from "@ai16z/eliza";
 import duckdb from "duckdb";
-import { TextEncoder } from "util";
 import { ParquetReader } from "@dsnp/parquetjs";
 import { writeParquetToBuffer } from "./stream.service.js";
 import { ChainName, getChain, testnet } from "@recallnet/chains";
 import { AccountInfo } from "@recallnet/sdk/account";
 import { ListResult } from "@recallnet/sdk/bucket";
+import { AccessControlService } from "./acc.service.js";
 import {
   RecallClient,
   walletClientFromPrivateKey,
@@ -44,6 +44,17 @@ interface Memory {
   /** Embedding similarity score */
   similarity?: number;
 }
+
+export type KnowledgeRecord = {
+  id: string;
+  userId: string;
+  agentId: string;
+  content: Content;
+  embedding: number[];
+  roomId: string;
+  createdAt: string;
+  knowledgeFileKey: string; // Key in Recall where this record is stored
+};
 
 type Result<T = unknown> = {
   result: T;
@@ -81,8 +92,6 @@ const privateKey = process.env.RECALL_PRIVATE_KEY as Hex;
 const envAlias = process.env.RECALL_BUCKET_ALIAS as string;
 const envPrefix = process.env.RECALL_MEMORY_PREFIX as string;
 const network = process.env.RECALL_NETWORK as string;
-const intervalPeriod = process.env.RECALL_SYNC_INTERVAL as string;
-const batchSize = process.env.RECALL_BATCH_SIZE as string;
 
 // Add debug logging for environment variables
 elizaLogger.info("Environment configuration:", {
@@ -90,8 +99,6 @@ elizaLogger.info("Environment configuration:", {
   RECALL_BUCKET_ALIAS: envAlias,
   RECALL_MEMORY_PREFIX: envPrefix,
   RECALL_NETWORK: network,
-  RECALL_SYNC_INTERVAL: intervalPeriod,
-  RECALL_BATCH_SIZE: batchSize,
 });
 
 export class RecallService extends Service {
@@ -102,14 +109,11 @@ export class RecallService extends Service {
 
   private client: RecallClient;
   private runtime: IAgentRuntime;
-  private syncInterval: NodeJS.Timeout | undefined;
   private alias: string;
   private prefix: string;
   private db: duckdb.Connection;
+  private accessControlService: AccessControlService | undefined;
   private processedFiles: Set<string> = new Set();
-  private intervalMs: number;
-  private batchSizeKB: number;
-  private lastSyncTime: number = 0;
   private isInitialized: boolean = false;
 
   getInstance(): RecallService {
@@ -260,30 +264,9 @@ export class RecallService extends Service {
         throw loadError;
       }
 
-      // Set up sync configuration
-      elizaLogger.info("Setting up sync configuration");
-      this.intervalMs = intervalPeriod
-        ? parseInt(intervalPeriod, 10)
-        : 2 * 60 * 1000;
-      this.batchSizeKB = batchSize ? parseInt(batchSize, 10) : 4;
-      elizaLogger.info(
-        `Sync configuration: interval=${this.intervalMs}ms, batchSize=${this.batchSizeKB}KB`
-      );
-
-      // Start periodic sync
-      elizaLogger.info("Loading last sync time from Parquet files...");
-      try {
-        await this.loadLastSyncTimeFromLatestParquet();
-        elizaLogger.info(`Last sync time set to: ${this.lastSyncTime}`);
-      } catch (syncTimeError) {
-        elizaLogger.error(
-          `Error loading last sync time: ${syncTimeError.message}`
-        );
-        this.lastSyncTime = 0;
-      }
-
-      // Continue with starting periodic sync...
-      this.startPeriodicSync(this.intervalMs, this.batchSizeKB);
+      // Initialize accessControlService
+      await this.initializeAccessControlService();
+      elizaLogger.info("accessControlService initialized");
 
       this.isInitialized = true;
       elizaLogger.success("RecallService initialized successfully");
@@ -294,6 +277,37 @@ export class RecallService extends Service {
         runtimeExists: !!this.runtime,
       });
       throw error;
+    }
+  }
+
+  /**
+   * Initialize the AccessControlService during RecallService initialization
+   * Add this to your initialize() method
+   */
+  async initializeAccessControlService(): Promise<boolean> {
+    try {
+      elizaLogger.info(
+        "Initializing AccessControlService for encryption/decryption"
+      );
+      this.accessControlService = AccessControlService.getInstance();
+      await this.accessControlService.start();
+
+      if (!this.accessControlService.isConfigured()) {
+        elizaLogger.warn(
+          "AccessControlService is not properly configured. Content will not be encrypted."
+        );
+        return false;
+      } else {
+        elizaLogger.info(
+          "AccessControlService initialized successfully. Content encryption is enabled."
+        );
+        return true;
+      }
+    } catch (error) {
+      elizaLogger.error(
+        `Error initializing AccessControlService: ${error.message}`
+      );
+      return false;
     }
   }
 
@@ -796,86 +810,6 @@ export class RecallService extends Service {
   }
 
   /**
-   * Loads the most recent sync time by finding the latest Parquet file in Recall.
-   * @returns A promise that resolves when the time is loaded.
-   */
-  private async loadLastSyncTimeFromLatestParquet(): Promise<void> {
-    try {
-      const bucketAddress = await this.getOrCreateBucket(this.alias);
-
-      // Query for all objects with our prefix
-      const queryResult = await this.client
-        .bucketManager()
-        .query(bucketAddress, { prefix: this.prefix });
-
-      if (
-        !queryResult.result?.objects ||
-        queryResult.result.objects.length === 0
-      ) {
-        // No existing files found, start from the beginning
-        elizaLogger.info(
-          "No existing Parquet files found. Will sync all memories."
-        );
-        this.lastSyncTime = 0;
-        return;
-      }
-
-      // Filter for only Parquet files with our prefix pattern
-      const parquetFiles = queryResult.result.objects
-        .map((obj) => obj.key)
-        .filter(
-          (key) => key.startsWith(this.prefix) && key.endsWith(".parquet")
-        );
-
-      if (parquetFiles.length === 0) {
-        // No matching Parquet files
-        elizaLogger.info(
-          "No existing Parquet files match our pattern. Will sync all memories."
-        );
-        this.lastSyncTime = 0;
-        return;
-      }
-
-      // Extract timestamps from filenames and find the most recent one
-      const timestamps = parquetFiles
-        .map((filename) => {
-          // Extract timestamp from pattern like "prefix1234567890.parquet"
-          const timestampStr = filename.substring(
-            this.prefix.length,
-            filename.length - ".parquet".length
-          );
-          return parseInt(timestampStr, 10);
-        })
-        .filter((ts) => !isNaN(ts));
-
-      if (timestamps.length === 0) {
-        // No valid timestamps found
-        elizaLogger.warn(
-          "No valid timestamps found in Parquet filenames. Will sync all memories."
-        );
-        this.lastSyncTime = 0;
-        return;
-      }
-
-      // Use the most recent timestamp
-      this.lastSyncTime = Math.max(...timestamps);
-
-      elizaLogger.info(
-        `Found latest Parquet file timestamp: ${this.lastSyncTime}`,
-        {
-          formattedTime: new Date(this.lastSyncTime).toISOString(),
-        }
-      );
-    } catch (error) {
-      elizaLogger.error(
-        `Error loading last sync time from Parquet files: ${error.message}`
-      );
-      // Default to 0 to sync everything
-      this.lastSyncTime = 0;
-    }
-  }
-
-  /**
    * Stores a batch of knowledge to Recall.
    * @param bucketAddress The address of the bucket to store knowledge.
    * @param batch The batch of memories to store.
@@ -919,7 +853,29 @@ export class RecallService extends Service {
       elizaLogger.info(
         `Transforming ${preparedMemories.length} memories to knowledge format`
       );
-      const cotRecords = preparedMemories.map((memory) => {
+
+      // Encrypt memory content before storing
+      const encryptedMemories = await Promise.all(
+        preparedMemories.map(async (memory) => {
+          let finalMemory;
+          if (!this.accessControlService) {
+            elizaLogger.warn(
+              "AccessControlService is unavailable, storing data without encryption."
+            );
+            finalMemory = memory;
+          } else {
+            finalMemory =
+              await this.accessControlService.prepareMemoryForStorage(memory);
+            if (!finalMemory) {
+              elizaLogger.error(`Failed to encrypt memory ${memory.id}`);
+              return memory;
+            }
+          }
+          return finalMemory;
+        })
+      );
+
+      const memoryRecords = encryptedMemories.map((memory) => {
         // Log the memory structure before transformation
         elizaLogger.debug(`Memory pre-transform:`, {
           id: memory.id,
@@ -966,7 +922,7 @@ export class RecallService extends Service {
       });
 
       // Verify all records have valid embeddings before proceeding
-      const withoutEmbeddings = cotRecords.filter(
+      const withoutEmbeddings = memoryRecords.filter(
         (record) =>
           !record.embedding ||
           !Array.isArray(record.embedding) ||
@@ -989,17 +945,17 @@ export class RecallService extends Service {
 
       // More detailed logging around Parquet creation
       elizaLogger.info(
-        `Attempting to create Parquet buffer for ${cotRecords.length} records with structure:`,
+        `Attempting to create Parquet buffer for ${memoryRecords.length} records with structure:`,
         {
-          sampleKeys: Object.keys(cotRecords[0]),
-          hasSampleEmbedding: !!cotRecords[0].embedding,
-          sampleEmbeddingLength: cotRecords[0].embedding?.length,
+          sampleKeys: Object.keys(memoryRecords[0]),
+          hasSampleEmbedding: !!memoryRecords[0].embedding,
+          sampleEmbeddingLength: memoryRecords[0].embedding?.length,
         }
       );
 
       try {
         // Create the Parquet schema to match the CoT format
-        const parquetBuffer = await writeParquetToBuffer(cotRecords);
+        const parquetBuffer = await writeParquetToBuffer(memoryRecords);
 
         if (!parquetBuffer) {
           elizaLogger.error("writeParquetToBuffer returned undefined");
@@ -1045,7 +1001,7 @@ export class RecallService extends Service {
         }
 
         elizaLogger.info(
-          `Successfully stored batch of ${cotRecords.length} records at key: ${nextKnowledgeKey}`
+          `Successfully stored batch of ${memoryRecords.length} records at key: ${nextKnowledgeKey}`
         );
         return nextKnowledgeKey;
       } catch (parquetError) {
@@ -1070,287 +1026,44 @@ export class RecallService extends Service {
     }
   }
 
-  /**
-   * Simplified version of syncKnowledgeToRecall that uses the latest Parquet timestamp
-   * @param bucketAlias The alias of the bucket to store knowledge.
-   * @param batchSizeKB The maximum size of each batch in kilobytes.
-   */
-  async syncKnowledgeToRecall(
-    bucketAlias: string,
-    batchSizeKB = 4
-  ): Promise<void> {
+  async writeKnowledgeToRecall(message: Memory): Promise<string | undefined> {
     try {
-      // Load the current time as our end point for this sync cycle
-      const currentTime = Date.now();
-
-      // Get or create the bucket
       const bucketAddress = await this.withTimeout(
-        this.getOrCreateBucket(bucketAlias),
+        this.getOrCreateBucket(this.alias),
         15000,
         "Get/Create bucket"
       );
 
-      // Get memories created after our last sync timestamp
-      const unsyncedMemories = await this.getUnsyncedMemories(
-        this.lastSyncTime,
-        currentTime
+      elizaLogger.info(`📂 Processing message ID=${message.id}`);
+
+      const knowledgeFileKey = await this.storeBatchToRecall(
+        bucketAddress,
+        [message] // Syncing only the input message
       );
 
-      if (!unsyncedMemories || unsyncedMemories.length === 0) {
-        elizaLogger.info("📭 No new memories found for synchronization.");
-        return;
-      }
-
-      elizaLogger.info(
-        `📥 Found ${unsyncedMemories.length} new memories to sync`,
-        {
-          fromTime: new Date(this.lastSyncTime).toISOString(),
-          toTime: new Date(currentTime).toISOString(),
-        }
-      );
-
-      // Group memories by roomId for better organization
-      const memoriesByRoom = this.groupMemoriesByRoom(unsyncedMemories);
-
-      let syncedCount = 0;
-      let successfullySynced = false;
-
-      for (const [roomId, memories] of Object.entries(memoriesByRoom)) {
-        try {
-          elizaLogger.info(
-            `📂 Processing ${memories.length} memories for room ${roomId}`
-          );
-
-          let batch: Memory[] = [];
-          let batchSize = 0;
-
-          for (const memory of memories) {
-            const memoryStr = JSON.stringify(memory);
-            const memorySize = new TextEncoder().encode(memoryStr).length;
-
-            elizaLogger.debug(
-              `📏 Memory ID=${memory.id}, Size=${memorySize} bytes`
-            );
-
-            // If adding this memory exceeds the batch size limit, sync the current batch
-            if (
-              batchSize + memorySize > batchSizeKB * 1024 &&
-              batch.length > 0
-            ) {
-              elizaLogger.info(
-                `📤 Batch size limit reached (${batchSize} bytes). Uploading batch of ${batch.length} memories...`
-              );
-
-              const knowledgeFileKey = await this.storeBatchToRecall(
-                bucketAddress,
-                batch
-              );
-
-              if (knowledgeFileKey) {
-                for (const syncedMemory of batch) {
-                  await this.insertKnowledgeIntoDuckDB(
-                    syncedMemory,
-                    knowledgeFileKey
-                  );
-                }
-                syncedCount += batch.length;
-                successfullySynced = true;
-                elizaLogger.success(
-                  `✅ Successfully synced batch of ${batch.length} memories (${batchSize} bytes)`
-                );
-              } else {
-                elizaLogger.warn(
-                  `⚠️ Failed to sync batch of ${batch.length} memories - will retry on next sync`
-                );
-              }
-
-              // Reset batch
-              batch = [];
-              batchSize = 0;
-            }
-
-            batch.push(memory);
-            batchSize += memorySize;
-          }
-
-          // Handle final batch (only if it's large enough)
-          if (batch.length > 0) {
-            if (batchSize < batchSizeKB * 1024) {
-              elizaLogger.info(
-                `🔄 Final batch (${batchSize} bytes) is below ${batchSizeKB}KB threshold. Holding until next sync.`
-              );
-            } else {
-              elizaLogger.info(
-                `📤 Uploading final batch of ${batch.length} memories (${batchSize} bytes)...`
-              );
-
-              const knowledgeFileKey = await this.storeBatchToRecall(
-                bucketAddress,
-                batch
-              );
-
-              if (knowledgeFileKey) {
-                for (const syncedMemory of batch) {
-                  await this.insertKnowledgeIntoDuckDB(
-                    syncedMemory,
-                    knowledgeFileKey
-                  );
-                }
-                syncedCount += batch.length;
-                successfullySynced = true;
-                elizaLogger.success(
-                  `✅ Successfully synced final batch of ${batch.length} memories`
-                );
-              } else {
-                elizaLogger.warn(
-                  `⚠️ Failed to sync final batch of ${batch.length} memories - will retry on next sync`
-                );
-              }
-            }
-          }
-        } catch (error) {
-          elizaLogger.error(
-            `❌ Error processing memories for room ${roomId}: ${error.message}`
-          );
-        }
-      }
-
-      // If at least one batch was successfully synced, update the last sync time
-      // to the currentTime (from when we started this sync cycle)
-      if (successfullySynced) {
-        this.lastSyncTime = currentTime;
-        // No need to explicitly save lastSyncTime anymore
-        elizaLogger.info(
-          `Updated lastSyncTime to ${currentTime} (${new Date(currentTime).toISOString()})`
-        );
+      if (knowledgeFileKey) {
+        await this.insertKnowledgeIntoDuckDB(message, knowledgeFileKey);
+        elizaLogger.success(`✅ Successfully synced message ID=${message.id}`);
+        return knowledgeFileKey;
       } else {
-        elizaLogger.info(
-          `⚠️ No batches met the size threshold. Last sync time remains: ${this.lastSyncTime}`
+        elizaLogger.warn(
+          `⚠️ Failed to sync message ID=${message.id} - will retry on next sync`
         );
+        return undefined;
       }
-
-      elizaLogger.info(
-        `🔄 Sync cycle complete. Synced ${syncedCount}/${unsyncedMemories.length} memories. Next sync in ${this.intervalMs / 1000} seconds.`
-      );
     } catch (error) {
       if (error.message.includes("timed out")) {
         elizaLogger.error(
           `⏳ Recall sync operation timed out: ${error.message}`
         );
+        return undefined;
       } else {
         elizaLogger.error(
-          `❌ Error in syncKnowledgeToRecall: ${error.message}`
+          `❌ Error in writeKnowledgeToRecall: ${error.message}`
         );
+        return undefined;
       }
     }
-  }
-
-  /**
-   * Retrieves unsynced memories within a specified time range.
-   * @param startTime The start timestamp to retrieve memories from.
-   * @param endTime The end timestamp to retrieve memories until.
-   * @returns A Promise resolving to an array of unsynced Memory objects.
-   */
-  private async getUnsyncedMemories(
-    startTime: number,
-    endTime: number
-  ): Promise<Memory[]> {
-    try {
-      // Get list of room IDs the agent participates in
-      const agentId = this.runtime.agentId;
-      const agentRooms =
-        await this.runtime.databaseAdapter.getRoomsForParticipant(agentId);
-
-      if (!agentRooms || agentRooms.length === 0) {
-        elizaLogger.info("No rooms found for the agent.");
-        return [];
-      }
-
-      // Log the rooms that were found
-      elizaLogger.info(
-        `Found ${agentRooms.length} rooms for agent: ${agentId}`
-      );
-
-      // Collect all memories across all rooms
-      let allMemories: Memory[] = [];
-
-      // Try to get all memory counts first to validate our expectation
-      for (const roomId of agentRooms) {
-        try {
-          const count = await this.runtime.messageManager.countMemories(
-            roomId,
-            false
-          );
-          elizaLogger.info(`Room ${roomId} has ${count} total memories`);
-        } catch (error) {
-          elizaLogger.error(
-            `Error counting memories for room ${roomId}: ${error.message}`
-          );
-        }
-      }
-
-      // Now fetch the actual memories
-      for (const roomId of agentRooms) {
-        try {
-          // Use the memory manager to get memories within the time range
-          // NOTE: Setting a very large limit to ensure we get all memories
-          const roomMemories = await this.runtime.messageManager.getMemories({
-            roomId,
-            start: startTime,
-            end: endTime,
-            count: 1000,
-            unique: false,
-          });
-
-          if (roomMemories && roomMemories.length > 0) {
-            elizaLogger.info(
-              `Retrieved ${roomMemories.length} memories from room ${roomId}`
-            );
-            allMemories = allMemories.concat(roomMemories);
-          } else {
-            elizaLogger.info(
-              `No memories found in room ${roomId} within time range`
-            );
-          }
-        } catch (error) {
-          elizaLogger.error(
-            `Error getting memories for room ${roomId}: ${error.message}`
-          );
-        }
-      }
-
-      elizaLogger.info(
-        `Total memories found across all rooms: ${allMemories.length}`
-      );
-
-      // Ensure all memories have embeddings
-      const memoriesWithEmbeddings =
-        await this.prepareMemoriesForStorage(allMemories);
-
-      return memoriesWithEmbeddings;
-    } catch (error) {
-      elizaLogger.error(`Error getting unsynced memories: ${error.message}`);
-      return [];
-    }
-  }
-
-  /**
-   * Groups memories by their room IDs.
-   * @param memories Array of memories to group.
-   * @returns An object mapping room IDs to arrays of memories.
-   */
-  private groupMemoriesByRoom(memories: Memory[]): Record<string, Memory[]> {
-    const result: Record<string, Memory[]> = {};
-
-    for (const memory of memories) {
-      if (!result[memory.roomId]) {
-        result[memory.roomId] = [];
-      }
-
-      result[memory.roomId].push(memory);
-    }
-
-    return result;
   }
 
   /**
@@ -1539,16 +1252,19 @@ export class RecallService extends Service {
         return [];
       }
 
-      const queryEmbeddingArray = `ARRAY[${[...queryEmbedding].join(",")}]`; // ✅ Inline embedding
+      elizaLogger.info("🔍 Query Embedding Generated", {
+        queryEmbeddingExists: !!queryEmbedding,
+        embeddingLength: queryEmbedding?.length,
+        first10Values: queryEmbedding?.slice(0, 10),
+      });
 
-      const roomIdsList = roomIds.map((id) => `'${id}'`).join(","); // ✅ Convert to SQL-friendly format
+      const queryEmbeddingArray = `ARRAY[${[...queryEmbedding].join(",")}]`; // ✅ Inline embedding
 
       const query = `
       SELECT id, userId, agentId, content, roomId, createdAt,
           1 - (embedding <-> ${queryEmbeddingArray}) AS similarity 
       FROM knowledge 
-      WHERE roomId IN (${roomIdsList})  -- ✅ Fully inlined values
-      AND similarity > ${threshold || 0.7}
+      WHERE similarity > ${threshold || 0.7}
       ORDER BY similarity DESC 
       LIMIT ${limit || 10};
     `;
@@ -1707,64 +1423,6 @@ export class RecallService extends Service {
   }
 
   /**
-   * Starts the periodic knowledge syncing with simplified timestamp tracking
-   * @param intervalMs The interval in milliseconds for syncing knowledge.
-   * @param batchSizeKB The maximum size of each batch in kilobytes.
-   */
-  public startPeriodicSync(intervalMs = 2 * 60 * 1000, batchSizeKB = 4): void {
-    if (this.syncInterval) {
-      elizaLogger.warn("Knowledge sync is already running.");
-      return;
-    }
-
-    elizaLogger.info(
-      `Starting periodic knowledge sync (every ${intervalMs / 1000}s)...`
-    );
-
-    this.syncInterval = setInterval(async () => {
-      try {
-        // Process any new knowledge files first
-        await this.retrieveAndProcessKnowledgeFiles(this.alias);
-
-        // Then sync new memories to Recall
-        await this.syncKnowledgeToRecall(this.alias, batchSizeKB);
-
-        elizaLogger.info("Periodic knowledge sync completed successfully.");
-      } catch (error) {
-        elizaLogger.error(`Periodic knowledge sync failed: ${error.message}`, {
-          stack: error.stack,
-        });
-      }
-    }, intervalMs);
-
-    // Perform immediate sync on startup
-    (async () => {
-      try {
-        elizaLogger.info("Performing initial sync...");
-        await this.retrieveAndProcessKnowledgeFiles(this.alias);
-        await this.syncKnowledgeToRecall(this.alias, batchSizeKB);
-        elizaLogger.info("Initial knowledge sync completed.");
-      } catch (error) {
-        elizaLogger.error(`Initial knowledge sync failed: ${error.message}`, {
-          stack: error.stack,
-        });
-      }
-    })();
-  }
-
-  /**
-   * Stops the periodic knowledge syncing.
-   */
-  public stopPeriodicSync(): void {
-    if (this.syncInterval) {
-      clearInterval(this.syncInterval);
-      this.syncInterval = undefined;
-      elizaLogger.info("Stopped periodic knowledge syncing.");
-    }
-  }
-
-  // 2. Fix the processing of existing Parquet files
-  /**
    * Retrieves and processes a specific knowledge file from Recall.
    * @param bucketAddress The bucket address containing the file.
    * @param knowledgeFile The filename/key to process.
@@ -1775,18 +1433,20 @@ export class RecallService extends Service {
     knowledgeFile: string
   ): Promise<void> {
     try {
-      elizaLogger.info(`Processing knowledge file: ${knowledgeFile}`);
+      elizaLogger.info(`📂 Processing knowledge file: ${knowledgeFile}`);
+
+      // Retrieve the Parquet file from Recall
       const fileData = await this.client
         .bucketManager()
         .get(bucketAddress, knowledgeFile);
-
       if (!fileData.result) {
         elizaLogger.warn(
-          `Invalid or empty result for knowledge file: ${knowledgeFile}`
+          `⚠️ No data found in knowledge file: ${knowledgeFile}`
         );
         return;
       }
 
+      // Convert file data to Buffer
       let parquetBuffer: Buffer;
       if (Buffer.isBuffer(fileData.result)) {
         parquetBuffer = fileData.result;
@@ -1804,21 +1464,22 @@ export class RecallService extends Service {
       }
 
       elizaLogger.info(
-        `Parquet buffer created, size: ${parquetBuffer.length} bytes`
+        `✅ Retrieved Parquet buffer (${parquetBuffer.length} bytes) for processing.`
       );
+
       const reader = await ParquetReader.openBuffer(parquetBuffer);
       const cursor = reader.getCursor();
-
       let recordCount = 0;
+      let decryptedCount = 0;
       let record: AnyType;
 
       while ((record = await cursor.next())) {
         recordCount++;
 
-        // Debug record structure to understand what fields are available
+        // Debug first record structure
         if (recordCount === 1) {
           elizaLogger.debug(
-            `First record structure: ${Object.keys(record).join(", ")}`
+            `🔍 First record structure: ${Object.keys(record).join(", ")}`
           );
         }
 
@@ -1826,10 +1487,10 @@ export class RecallService extends Service {
         const agentId = record.agentId;
         const embedding = record.embedding;
 
-        // Skip records that are definitely missing critical fields
+        // Skip records missing critical fields
         if (!userId || !agentId || !embedding || !Array.isArray(embedding)) {
           elizaLogger.warn(
-            `Record missing critical fields in ${knowledgeFile}, skipping`,
+            `⚠️ Skipping record missing critical fields in ${knowledgeFile}`,
             {
               recordKeys: Object.keys(record),
               hasUserId: !!userId,
@@ -1841,35 +1502,33 @@ export class RecallService extends Service {
         }
 
         try {
-          // Get text content from either userMessage or log field
-          const messageText = record.userMessage || "";
-          const logText = record.log || "";
-          const text = messageText || logText || "No content available";
+          // Extract and decrypt content
+          const originalText =
+            record.userMessage || record.log || "No content available";
+          if (!this.accessControlService) {
+            return originalText;
+          }
+          const decryptedText = await this.decryptContentIfNeeded(
+            originalText,
+            this.accessControlService
+          );
+          if (decryptedText !== originalText) decryptedCount++;
 
           // Create Content object
-          const content: Content = { text };
+          const content: Content = { text: decryptedText };
 
-          // Generate a deterministic ID based on record data
-          const idBase = `${userId}-${agentId}-${record.timestamp || Date.now()}`;
-          const memoryId = stringToUuid(idBase);
+          // Generate unique memory ID
+          const memoryId = stringToUuid(
+            `${userId}-${agentId}-${record.timestamp || Date.now()}`
+          );
 
-          // Create a room ID from userId and agentId
+          // Generate Room ID
           const roomId = stringToUuid(`room-${userId}-${agentId}`);
 
-          // Convert timestamp string to number if available
-          let timestamp: number;
-          try {
-            // Try to parse the timestamp if it exists
-            timestamp = record.timestamp
-              ? new Date(record.timestamp).getTime()
-              : Date.now();
-          } catch (e) {
-            // Fall back to current time if parsing fails
-            timestamp = Date.now();
-            elizaLogger.warn(
-              `Failed to parse timestamp in record: ${e.message}`
-            );
-          }
+          // Parse timestamp
+          const timestamp = record.timestamp
+            ? new Date(record.timestamp).getTime()
+            : Date.now();
 
           // Convert record to Memory format
           const memoryRecord: Memory = {
@@ -1886,7 +1545,7 @@ export class RecallService extends Service {
           await this.insertKnowledgeIntoDuckDB(memoryRecord, knowledgeFile);
         } catch (recordError) {
           elizaLogger.error(
-            `Error processing record in ${knowledgeFile}: ${recordError.message}`,
+            `❌ Error processing record in ${knowledgeFile}: ${recordError.message}`,
             {
               error: recordError,
               stack: recordError.stack,
@@ -1898,12 +1557,12 @@ export class RecallService extends Service {
 
       await reader.close();
       elizaLogger.info(
-        `Processed ${recordCount} records from file ${knowledgeFile}`
+        `✅ Successfully processed ${recordCount} records from ${knowledgeFile}. 🔓 Decrypted ${decryptedCount} records.`
       );
       await this.markFileAsProcessed(knowledgeFile);
     } catch (error) {
       elizaLogger.error(
-        `Error processing file ${knowledgeFile}: ${error.message}`,
+        `❌ Error processing file ${knowledgeFile}: ${error.message}`,
         {
           error,
           stack: error.stack,
@@ -1911,6 +1570,38 @@ export class RecallService extends Service {
       );
       throw error;
     }
+  }
+
+  /**
+   * Decrypts a message if it's encrypted; otherwise, returns it as-is.
+   * @param contentText The text content of a memory entry.
+   * @param accessControlService The AccessControlService instance.
+   * @returns Decrypted content if encrypted, otherwise the original content.
+   */
+  private async decryptContentIfNeeded(
+    contentText: string,
+    accessControlService: AccessControlService
+  ): Promise<string> {
+    try {
+      if (!contentText) return contentText;
+
+      // Attempt to parse JSON (to check if it's encrypted)
+      const contentJson = JSON.parse(contentText);
+      if (contentJson.ciphertext && contentJson.dataToEncryptHash) {
+        elizaLogger.debug(`🔓 Attempting to decrypt message...`);
+        const decryptedText = await accessControlService.decryptMessage(
+          contentJson.ciphertext,
+          contentJson.dataToEncryptHash
+        );
+        if (decryptedText) {
+          elizaLogger.info(`✅ Successfully decrypted message.`);
+          return decryptedText;
+        }
+      }
+    } catch (e) {
+      // Not encrypted JSON, just return original content
+    }
+    return contentText;
   }
 
   /**
