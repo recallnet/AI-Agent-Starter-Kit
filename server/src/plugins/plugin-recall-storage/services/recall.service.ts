@@ -1178,7 +1178,6 @@ export class RecallService extends Service {
   /**
    * Query knowledge across multiple rooms with relevance to a given text.
    * @param queryText The text to search for relevant knowledge.
-   * @param roomIds Optional array of room IDs to search in. If not provided, searches across all rooms.
    * @param limit The maximum number of results to return.
    * @param threshold The minimum similarity threshold.
    * @returns An array of knowledge items formatted for use in the runtime.
@@ -1247,16 +1246,9 @@ export class RecallService extends Service {
 
       // Check if any results were found
       if (!searchResults || searchResults.length === 0) {
-        elizaLogger.warn(
-          "⚠️ No similar knowledge found. Consider lowering the threshold."
-        );
+        elizaLogger.warn("⚠️ No similar knowledge found.");
         return [];
       }
-
-      // Debug first search result
-      elizaLogger.info("🔍 First search result:", {
-        firstResult: searchResults[0],
-      });
 
       // Transform results into KnowledgeItem format
       return searchResults.map((result) => {
